@@ -5,7 +5,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange)](Cargo.toml)
 
 `fqc` 是一个用 Rust 编写的 FASTQ 压缩工具，围绕块索引的 `.fqc` 归档格式构建。
-它将短读 ABC 路径、Zstd 支撑的中/长读压缩与质量分编码整合进单一 CLI，支持压缩、解压、检视与校验。
+它将短读 ABC 路径（实验性，≤512 条/块）、Zstd 支撑的中/长读压缩与质量分编码整合进单一 CLI，支持压缩、解压、检视与校验。
 
 *A block-indexed FASTQ archive format and CLI in Rust — compress, inspect, verify, partially stream.*
 
@@ -45,7 +45,11 @@ cargo build --release
 
 安装到 PATH、双端输入、`--streaming`/`--pipeline` 模式、区间解压等见
 [快速开始教程](docs/tutorials/quick-start.md)；全部命令与选项（含全局 `--memory-limit`）
-见 [CLI 参考](docs/reference/cli.md)。
+见 [CLI 参考](docs/reference/cli.md)。长读 archive/pipeline 默认按约 5M bases/block
+自动切块；容器内 `--memory-limit 0` 会自动参考 cgroup 剩余额度，大文件仍建议显式限制。
+
+Linux aarch64 / Kunpeng 服务器的构建、线程和部署注意事项见
+[安装指南的 ARM 小节](docs/how-to/installation.md#arm64--aarch64-linux-服务器)。
 
 ## 文档
 

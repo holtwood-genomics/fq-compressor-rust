@@ -15,10 +15,11 @@ use fqc::archive::reader::FqcReader;
 use fqc::archive::writer::FqcWriter;
 use fqc::commands::compress::{CompressCommand, CompressOptions};
 use fqc::commands::decompress::{DecompressCommand, DecompressOptions};
-use fqc::engine::compression_request::CompressionInputTopology;
 use fqc::error::ExitCode;
 use fqc::fastq::parser::{FastqParser, ParserOptions};
 use fqc::io::compressed_stream::*;
+use fqc::plan::compress::CompressionInputTopology;
+use fqc::plan::ReorderMode;
 use fqc::types::*;
 
 // =============================================================================
@@ -194,20 +195,20 @@ fn decompress_file(input_path: &str, output_path: &str) {
     let mut out = std::io::BufWriter::new(std::fs::File::create(output_path).unwrap());
     for block_id in 0..block_count {
         let bd = reader.read_block(block_id as u32).unwrap();
-        let bh = &bd.header;
+        let bh = &bd.meta;
         let dec = compressor
             .decompress_raw(
                 bh.block_id,
-                bh.uncompressed_count,
+                bh.read_count,
                 bh.uniform_read_length,
                 bh.codec_ids,
                 bh.codec_seq,
                 bh.codec_qual,
                 bh.codec_aux,
-                &bd.ids_data,
-                &bd.seq_data,
-                &bd.qual_data,
-                &bd.aux_data,
+                &bd.id_stream,
+                &bd.seq_stream,
+                &bd.qual_stream,
+                &bd.aux_stream,
             )
             .unwrap();
         for read in &dec.reads {
@@ -396,7 +397,7 @@ fn test_e2e_exit_codes() {
 
 #[test]
 fn test_e2e_memory_budget() {
-    use fqc::memory_budget::*;
+    use fqc::memory::*;
 
     let avail = get_available_memory_mb();
     assert!(avail > 0, "System memory detection failed");
@@ -410,7 +411,7 @@ fn test_e2e_memory_budget() {
 
 #[test]
 fn test_e2e_chunking_strategy() {
-    use fqc::memory_budget::ChunkingStrategy;
+    use fqc::memory::ChunkingStrategy;
 
     // Small dataset: should not require chunking
     let strat = ChunkingStrategy::compute(100_000, 150, 50_000, 4, 8192);
@@ -881,6 +882,158 @@ fn test_pipeline_skip_corrupted_emits_placeholder_reads() {
 }
 
 #[test]
+fn test_split_pe_skip_corrupted_keeps_pair_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let input_r1 = dir.path().join("split_skip_r1.fastq");
+    let input_r2 = dir.path().join("split_skip_r2.fastq");
+    let archive = dir.path().join("split_skip.fqc");
+    let output = dir.path().join("split_skip.out.fastq");
+    let r1 = synthetic_reads(&[20; 12], "split_skip_r1");
+    let r2 = synthetic_reads(&[20; 12], "split_skip_r2");
+    write_fastq_records(input_r1.to_str().unwrap(), &r1);
+    write_fastq_records(input_r2.to_str().unwrap(), &r2);
+
+    let compress_exit = CompressCommand::new(CompressOptions {
+        input_path: input_r1.to_string_lossy().into_owned(),
+        input2_path: Some(input_r2.to_string_lossy().into_owned()),
+        output_path: archive.to_string_lossy().into_owned(),
+        block_size: 4,
+        show_progress: false,
+        force_overwrite: true,
+        ..CompressOptions::default()
+    })
+    .execute();
+    assert_eq!(compress_exit, 0);
+
+    corrupt_block_codec_seq(archive.to_str().unwrap(), 0, 0xFF);
+
+    let decompress_exit = DecompressCommand::new(DecompressOptions {
+        input_path: archive.to_string_lossy().into_owned(),
+        output_path: output.to_string_lossy().into_owned(),
+        split_pe: true,
+        skip_corrupted: true,
+        corrupted_placeholder: Some("NN".to_string()),
+        show_progress: false,
+        force_overwrite: true,
+        ..DecompressOptions::default()
+    })
+    .execute();
+    assert_eq!(decompress_exit, 0);
+
+    let restored_r1 = dir.path().join("split_skip.out_R1.fastq");
+    let restored_r2 = dir.path().join("split_skip.out_R2.fastq");
+    let restored_r1 = read_fastq_records(restored_r1.to_str().unwrap());
+    let restored_r2 = read_fastq_records(restored_r2.to_str().unwrap());
+    assert_eq!(restored_r1.len(), r1.len());
+    assert_eq!(restored_r2.len(), r2.len());
+    assert_eq!(
+        restored_r1
+            .iter()
+            .filter(|read| read.id.starts_with("corrupted_block0_"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        restored_r2
+            .iter()
+            .filter(|read| read.id.starts_with("corrupted_block0_"))
+            .count(),
+        2
+    );
+    for read in restored_r1
+        .iter()
+        .filter(|read| !read.id.starts_with("corrupted_block"))
+    {
+        assert!(r1
+            .iter()
+            .any(|original| original.id == read.id && original.sequence == read.sequence));
+    }
+    for read in restored_r2
+        .iter()
+        .filter(|read| !read.id.starts_with("corrupted_block"))
+    {
+        assert!(r2
+            .iter()
+            .any(|original| original.id == read.id && original.sequence == read.sequence));
+    }
+}
+
+#[test]
+fn test_original_order_skip_corrupted_emits_placeholders() {
+    let input = TempFile::new("original_skip_corrupted.fastq");
+    let archive = TempFile::new("original_skip_corrupted.fqc");
+    let output = TempFile::new("original_skip_corrupted.out.fastq");
+    let original = synthetic_reads(&[40; 24], "original_skip");
+
+    write_fastq_records(input.path(), &original);
+    let compress_exit = CompressCommand::new(CompressOptions {
+        input_path: input.path().to_string(),
+        output_path: archive.path().to_string(),
+        block_size: 6,
+        reorder: ReorderMode::Always,
+        show_progress: false,
+        force_overwrite: true,
+        ..CompressOptions::default()
+    })
+    .execute();
+    assert_eq!(compress_exit, 0);
+
+    let mut reader = FqcReader::open(archive.path()).unwrap();
+    assert!(reader.has_reorder_map(), "original-order test needs a reorder map");
+    reader.load_reorder_map().unwrap();
+    let forward = reader
+        .reorder_forward
+        .clone()
+        .expect("loaded reorder map must expose the forward permutation");
+    let corrupted_entry = reader.block_index.entries[1].clone();
+    let corrupted_start = corrupted_entry.archive_id_start;
+    let corrupted_end = corrupted_entry.archive_id_end();
+    drop(reader);
+
+    corrupt_block_codec_seq(archive.path(), 1, 0xFF);
+
+    let decompress_exit = DecompressCommand::new(DecompressOptions {
+        input_path: archive.path().to_string(),
+        output_path: output.path().to_string(),
+        original_order: true,
+        skip_corrupted: true,
+        corrupted_placeholder: Some("NN".to_string()),
+        show_progress: false,
+        force_overwrite: true,
+        ..DecompressOptions::default()
+    })
+    .execute();
+    assert_eq!(decompress_exit, 0);
+
+    let restored = read_fastq_records(output.path());
+    assert_eq!(restored.len(), original.len());
+
+    // The forward map is original -> archive. A corrupted archive block must
+    // reappear at exactly the original coordinates that map into its archive
+    // read range, not merely at an arbitrary placeholder position.
+    let mut placeholders = 0;
+    for (original_id, &archive_id) in forward.iter().enumerate() {
+        let read = &restored[original_id];
+        if (corrupted_start..corrupted_end).contains(&archive_id) {
+            let local_idx = archive_id - corrupted_start;
+            assert_eq!(
+                read.id,
+                format!("corrupted_block1_read{local_idx}"),
+                "placeholder at original id {original_id} maps to archive id {archive_id}"
+            );
+            assert_eq!(read.sequence, "NN");
+            assert_eq!(read.quality, "!!");
+            placeholders += 1;
+        } else {
+            assert_eq!(read.id, original[original_id].id);
+            assert_eq!(read.sequence, original[original_id].sequence);
+            assert_eq!(read.quality, original[original_id].quality);
+        }
+    }
+    assert_eq!(placeholders, 6, "corrupted block must keep its read count");
+}
+
+#[test]
 fn test_e2e_scan_all_lengths_changes_length_classification() {
     let mut lengths = vec![150; 4096];
     lengths.push(12_000);
@@ -966,6 +1119,37 @@ fn test_e2e_max_block_bases_limits_long_read_block_count() {
     assert_eq!(capped_reader.block_count(), 5);
 }
 
+#[test]
+fn test_e2e_long_reads_auto_split_blocks() {
+    // Long starts at 10,240 bp; keep the fixture above the boundary so this
+    // test covers automatic detection, not just a forced read-length class.
+    let lengths = vec![12_000; 600];
+    let records = synthetic_reads(&lengths, "longread");
+    let input = TempFile::new("e2e_long_auto_split.fastq");
+    write_fastq_records(input.path(), &records);
+
+    for (suffix, use_pipeline) in [("archive", false), ("pipeline", true)] {
+        let archive = TempFile::new(&format!("e2e_long_auto_split_{suffix}.fqc"));
+        let exit = CompressCommand::new(CompressOptions {
+            input_path: input.path().to_string(),
+            output_path: archive.path().to_string(),
+            use_pipeline,
+            show_progress: false,
+            force_overwrite: true,
+            ..CompressOptions::default()
+        })
+        .execute();
+        assert_eq!(exit, 0, "{suffix} compression failed");
+
+        let reader = FqcReader::open(archive.path()).unwrap();
+        assert!(
+            reader.block_count() > 1,
+            "{suffix} should auto-split long reads, got {} block(s)",
+            reader.block_count()
+        );
+    }
+}
+
 // =============================================================================
 // E2E: Pipeline Compression Round-Trip
 // =============================================================================
@@ -981,13 +1165,8 @@ fn test_e2e_pipeline_roundtrip() {
     let config = CompressionPipelineConfig {
         num_threads: 2,
         block_size: 100,
-        read_length_class: ReadLengthClass::Short,
-        quality_mode: QualityMode::Lossless,
-        id_mode: IdMode::Exact,
-        compression_level: 3,
-        enable_reorder: false,
+        reorder: fqc::plan::ReorderMode::Never,
         save_reorder_map: false,
-        streaming_mode: false,
         pe_layout: PeLayout::Interleaved,
         ..Default::default()
     };
@@ -997,7 +1176,7 @@ fn test_e2e_pipeline_roundtrip() {
 
     let stats = pipeline.stats();
     assert_eq!(stats.total_reads, 20);
-    assert!(stats.total_blocks >= 1);
+    assert!(stats.blocks >= 1);
     assert!(stats.output_bytes > 0);
 
     decompress_file(compressed.path(), decompressed.path());
@@ -1016,13 +1195,8 @@ fn test_e2e_pipeline_respects_save_reorder_map_flag() {
     let config = CompressionPipelineConfig {
         num_threads: 2,
         block_size: 100,
-        read_length_class: ReadLengthClass::Short,
-        quality_mode: QualityMode::Lossless,
-        id_mode: IdMode::Exact,
-        compression_level: 3,
-        enable_reorder: true,
+        reorder: fqc::plan::ReorderMode::Always,
         save_reorder_map: false,
-        streaming_mode: false,
         pe_layout: PeLayout::Interleaved,
         ..Default::default()
     };
@@ -1058,13 +1232,9 @@ fn test_e2e_pipeline_long_reads_no_reorder_nonempty_archive() {
     let config = CompressionPipelineConfig {
         num_threads: 2,
         block_size: 100,
-        read_length_class: ReadLengthClass::Long,
-        quality_mode: QualityMode::Lossless,
-        id_mode: IdMode::Exact,
-        compression_level: 3,
-        enable_reorder: true,
+        requested_read_length_class: Some(ReadLengthClass::Long),
+        reorder: fqc::plan::ReorderMode::Always,
         save_reorder_map: false,
-        streaming_mode: false,
         pe_layout: PeLayout::Interleaved,
         ..Default::default()
     };
@@ -1077,9 +1247,9 @@ fn test_e2e_pipeline_long_reads_no_reorder_nonempty_archive() {
     let stats = pipeline.stats();
     assert_eq!(stats.total_reads, 40);
     assert!(
-        stats.total_blocks >= 1,
+        stats.blocks >= 1,
         "pipeline must not drop all reads for long-read input (got {} blocks)",
-        stats.total_blocks
+        stats.blocks
     );
     assert!(
         stats.output_bytes > 0,
@@ -1101,7 +1271,7 @@ fn test_e2e_pipeline_long_reads_no_reorder_nonempty_archive() {
 
 #[test]
 fn test_e2e_decompress_pipeline_roundtrip() {
-    use fqc::pipeline::decompression::{DecompressionPipeline, DecompressionPipelineConfig};
+    use fqc::pipeline::decompression::{DecompressionConfig, DecompressionPipeline};
 
     let input = test_data_dir().join("test_se.fastq").to_string_lossy().to_string();
     let compressed = TempFile::new("e2e_dec_pipeline.fqc");
@@ -1109,7 +1279,7 @@ fn test_e2e_decompress_pipeline_roundtrip() {
 
     compress_file(&input, compressed.path(), QualityMode::Lossless, IdMode::Exact, false);
 
-    let config = DecompressionPipelineConfig {
+    let config = DecompressionConfig {
         num_threads: 2,
         skip_corrupted: false,
         ..Default::default()
@@ -1290,31 +1460,38 @@ fn test_e2e_qvz_quality_quantizes_to_codebook() {
 #[test]
 fn test_e2e_archive_mode_honors_reorder_flag() {
     use fqc::engine::compression_engine::CompressionEngine;
-    use fqc::engine::compression_request::CompressionRequest;
+    use fqc::plan::compress::CompressionRequest;
 
     let input = test_data_dir().join("test_se.fastq").to_string_lossy().to_string();
     let reordered = TempFile::new("e2e_reorder_on.fqc");
     let plain = TempFile::new("e2e_reorder_off.fqc");
 
-    let mut req_on = CompressionRequest::for_tests();
-    req_on.input = CompressionInputTopology::SingleFile {
-        input_path: input.clone().into(),
+    let settings = |reorder| fqc::plan::compress::CompressionSettings {
+        force_overwrite: true,
+        reorder,
+        ..Default::default()
     };
-    req_on.output_path = reordered.path().into();
-    req_on.force_overwrite = true;
-    req_on.enable_reorder = true;
-    let outcome_on = CompressionEngine::new().run(&req_on).unwrap();
-    assert!(outcome_on.reorder_map_written);
+    let req_on = CompressionRequest::new(
+        fqc::plan::CompressionExecutionMode::Archive,
+        CompressionInputTopology::SingleFile {
+            input_path: input.clone().into(),
+        },
+        reordered.path(),
+    )
+    .with_settings(settings(fqc::plan::ReorderMode::Always));
+    let outcome_on = CompressionEngine::new().run(req_on).unwrap();
+    assert!(outcome_on.stats.reorder_map_written);
 
-    let mut req_off = CompressionRequest::for_tests();
-    req_off.input = CompressionInputTopology::SingleFile {
-        input_path: input.clone().into(),
-    };
-    req_off.output_path = plain.path().into();
-    req_off.force_overwrite = true;
-    req_off.enable_reorder = false;
-    let outcome_off = CompressionEngine::new().run(&req_off).unwrap();
-    assert!(!outcome_off.reorder_map_written);
+    let req_off = CompressionRequest::new(
+        fqc::plan::CompressionExecutionMode::Archive,
+        CompressionInputTopology::SingleFile {
+            input_path: input.clone().into(),
+        },
+        plain.path(),
+    )
+    .with_settings(settings(fqc::plan::ReorderMode::Never));
+    let outcome_off = CompressionEngine::new().run(req_off).unwrap();
+    assert!(!outcome_off.stats.reorder_map_written);
 
     let reader = FqcReader::open(plain.path()).unwrap();
     assert!(!reader.has_reorder_map());

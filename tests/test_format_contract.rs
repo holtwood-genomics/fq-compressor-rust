@@ -194,7 +194,7 @@ fn test_frozen_archive_block_uses_abc_codec() {
     let block = reader.read_block(0).expect("block 0 must read");
 
     // Short reads should use ABC for sequences.
-    assert_eq!(decode_codec_family(block.header.codec_seq), CodecFamily::AbcV1);
+    assert_eq!(decode_codec_family(block.meta.codec_seq), CodecFamily::AbcV1);
 }
 
 // =============================================================================
@@ -256,7 +256,7 @@ fn test_verify_rejects_corrupt_reorder_map() {
     let archive = dir.path().join("corrupt-map.fqc");
     std::fs::write(&archive, data).unwrap();
     let code = VerifyCommand::new(VerifyOptions {
-        input_path: archive.to_string_lossy().into_owned(),
+        input_path: archive.clone(),
         quick_mode: true,
         ..Default::default()
     })

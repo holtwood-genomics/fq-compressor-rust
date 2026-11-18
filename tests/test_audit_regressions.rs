@@ -6,10 +6,15 @@
 //! - parser rejects '+' line name mismatches
 //! - empty-sequence records round-trip and pass structural validation
 //! - inverted decompression ranges are rejected cleanly
+//! - ABC forward offsets beyond the short read's length still decode
 
 use fqc::algo::abc::{AbcCompressor, AbcConfig};
 use fqc::algo::block_compressor::{BlockCompressor, BlockCompressorConfig};
+use fqc::commands::compress::{CompressCommand, CompressOptions};
+use fqc::commands::decompress::{DecompressCommand, DecompressOptions};
+use fqc::commands::verify::{VerifyCommand, VerifyOptions};
 use fqc::fastq::parser::FastqParser;
+use fqc::plan::ReorderMode;
 use fqc::types::{IdMode, QualityMode, ReadLengthClass, ReadRecord};
 use std::io::BufReader;
 
@@ -44,24 +49,7 @@ fn repro_1_tokenize_corrupts_off_pattern_ids() {
     };
     let mut bc = BlockCompressor::new(cfg);
     let compressed = bc.compress(&reads, 0).unwrap();
-    let dec = bc
-        .decompress_block(&fqc::archive::traits::BlockData {
-            header: fqc::archive::format::BlockHeader {
-                block_id: 0,
-                uncompressed_count: reads.len() as u32,
-                codec_ids: compressed.codec_ids,
-                codec_seq: compressed.codec_seq,
-                codec_qual: compressed.codec_qual,
-                codec_aux: compressed.codec_aux,
-                uniform_read_length: compressed.uniform_read_length,
-                ..Default::default()
-            },
-            ids_data: compressed.id_stream,
-            seq_data: compressed.seq_stream,
-            qual_data: compressed.qual_stream,
-            aux_data: compressed.aux_stream,
-        })
-        .unwrap();
+    let dec = bc.decompress_block(&compressed).unwrap();
 
     let mut mismatches = Vec::new();
     for (i, r) in dec.reads.iter().enumerate() {
@@ -146,24 +134,7 @@ fn repro_3_lossy_archive_fails_own_checksum() {
     };
     let mut bc = BlockCompressor::new(cfg);
     let compressed = bc.compress(&reads, 0).unwrap();
-    let block = fqc::archive::traits::BlockData {
-        header: fqc::archive::format::BlockHeader {
-            block_id: 0,
-            uncompressed_count: reads.len() as u32,
-            codec_ids: compressed.codec_ids,
-            codec_seq: compressed.codec_seq,
-            codec_qual: compressed.codec_qual,
-            codec_aux: compressed.codec_aux,
-            block_xxhash64: compressed.block_checksum,
-            uniform_read_length: compressed.uniform_read_length,
-            ..Default::default()
-        },
-        ids_data: compressed.id_stream,
-        seq_data: compressed.seq_stream,
-        qual_data: compressed.qual_stream,
-        aux_data: compressed.aux_stream,
-    };
-    let dec = bc.decompress_block(&block).unwrap();
+    let dec = bc.decompress_block(&compressed).unwrap();
 
     // quality must actually be quantized (changed) for this test to be meaningful
     let qual_changed = dec.reads.iter().zip(reads.iter()).any(|(d, o)| d.quality != o.quality);
@@ -197,23 +168,7 @@ fn repro_5_forced_short_class_long_read_fails_decode() {
         ..Default::default()
     });
     let c2 = bc2.compress(&reads_many, 0).unwrap();
-    let block2 = fqc::archive::traits::BlockData {
-        header: fqc::archive::format::BlockHeader {
-            block_id: 0,
-            uncompressed_count: 20,
-            codec_ids: c2.codec_ids,
-            codec_seq: c2.codec_seq,
-            codec_qual: c2.codec_qual,
-            codec_aux: c2.codec_aux,
-            uniform_read_length: c2.uniform_read_length,
-            ..Default::default()
-        },
-        ids_data: c2.id_stream,
-        seq_data: c2.seq_stream,
-        qual_data: c2.qual_stream,
-        aux_data: c2.aux_stream,
-    };
-    let dec = bc2.decompress_block(&block2);
+    let dec = bc2.decompress_block(&c2);
     match dec {
         Ok(d) => {
             for (i, r) in d.reads.iter().enumerate() {
@@ -284,27 +239,24 @@ fn repro_6_inverted_range_stats() {
     let archive = dir.path().join("a.fqc");
 
     // compress via engine
-    let req = fqc::engine::compression_request::CompressionRequest {
-        mode: fqc::engine::compression_request::CompressionExecutionMode::Archive,
-        input: fqc::engine::compression_request::CompressionInputTopology::SingleFile {
+    let req = fqc::plan::compress::CompressionRequest::new(
+        fqc::plan::CompressionExecutionMode::Archive,
+        fqc::plan::compress::CompressionInputTopology::SingleFile {
             input_path: fastq.clone(),
         },
-        output_path: archive.clone(),
+        archive.clone(),
+    )
+    .with_settings(fqc::plan::compress::CompressionSettings {
         level: 5,
         quality_mode: QualityMode::Lossless,
         id_mode: IdMode::Exact,
-        enable_reorder: false,
-        requested_read_length_class: None,
+        reorder: fqc::plan::ReorderMode::Never,
         threads: 1,
-        memory_limit_mb: 0,
-        force_overwrite: false,
-        show_progress: false,
         block_size: 2,
-        max_block_bases: 0,
-        scan_all_lengths: false,
-    };
+        ..Default::default()
+    });
     fqc::engine::compression_engine::CompressionEngine::new()
-        .run(&req)
+        .run(req)
         .unwrap();
 
     // Now run the decompress command with inverted range
@@ -330,4 +282,65 @@ fn repro_6_inverted_range_stats() {
         "inverted range should be rejected with usage error, exit code {}",
         code
     );
+}
+
+// ---------------------------------------------------------------------------
+// BUG 9: ABC decoder rejected the encoder's own forward alignment offsets
+// ---------------------------------------------------------------------------
+#[test]
+fn repro_abc_short_read_forward_offset_archive_roundtrip() {
+    // The 10 bp read sits at offset 20 in the 58 bp consensus. That forward
+    // shift is larger than the short read's length, which used to make the
+    // archive compressible but impossible to decompress or verify.
+    let dir = tempfile::tempdir().unwrap();
+    let fastq = dir.path().join("in.fastq");
+    let archive = dir.path().join("out.fqc");
+    let restored = dir.path().join("restored.fastq");
+
+    let long = "ACGTTGCAAGTCCTAGGATCCGATGCTAGCTAGGCTAACGTTAGGCATCGATCGTACG";
+    let short = &long[20..30];
+    let input = format!(
+        "@r1\n{long}\n+\n{}\n@r2\n{short}\n+\n{}\n",
+        "I".repeat(long.len()),
+        "I".repeat(short.len())
+    );
+    std::fs::write(&fastq, &input).unwrap();
+
+    let compress = CompressCommand::new(CompressOptions {
+        input_path: fastq.to_string_lossy().into_owned(),
+        output_path: archive.to_string_lossy().into_owned(),
+        reorder: ReorderMode::Never,
+        show_progress: false,
+        force_overwrite: true,
+        ..CompressOptions::default()
+    })
+    .execute();
+    assert_eq!(compress, 0, "compression must succeed");
+
+    let decompress = DecompressCommand::new(DecompressOptions {
+        input_path: archive.to_string_lossy().into_owned(),
+        output_path: restored.to_string_lossy().into_owned(),
+        range_start: 0,
+        range_end: 0,
+        header_only: false,
+        original_order: false,
+        skip_corrupted: false,
+        corrupted_placeholder: None,
+        split_pe: false,
+        threads: 1,
+        show_progress: false,
+        force_overwrite: true,
+        use_pipeline: false,
+        memory_limit_mb: 0,
+    })
+    .execute();
+    assert_eq!(decompress, 0, "decompression must succeed");
+    assert_eq!(std::fs::read_to_string(&restored).unwrap(), input);
+
+    let verify = VerifyCommand::new(VerifyOptions {
+        input_path: archive,
+        ..VerifyOptions::default()
+    })
+    .execute();
+    assert_eq!(verify, 0, "full verification must pass");
 }

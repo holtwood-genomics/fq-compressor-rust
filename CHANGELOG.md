@@ -2,8 +2,189 @@
 
 ## [Unreleased]
 
+### Performance
+
+- 2026-11-08 Raw（Discard）质量流解压不再构造 order-2 质量模型：此前每个
+  discard block 都会 `ScmQualityCompressor::new` 分配约 13 MiB 上下文模型，
+  只为返回占位质量串；现在直接按长度生成 `!` 串。现有 decode 测试套件通过。
+
+- 2026-11-08 全局重排的 minimizer bucket 改为 `BTreeSet` 并在读被消费后立即移除：
+  旧实现每一步都从头扫描 bucket 中的已用读段，独立读段多时退化为
+  O(N × bucket)。集合同时保持确定的候选顺序。
+
+### Security
+
+- 2026-11-08 读长分类上限与解压预算统一：解压预算（worker 数、
+  `--original-order` 峰值估算）以前直接用头部 flags 里的读长分类，
+  而 `Long` 用的是 100 kbp 的「经验值」而非上限，伪造或异常的归档会让估算
+  变成低估。现在 `ReadLengthClass::max_read_length()` 给出三类硬上限
+  （Short 511、Medium 10239、Long 4 MiB），并：
+  - `validate_block_headers` 拒绝声明长度超过分类上限的块头；
+  - 解压/verify 路径把该上限作为 `BlockCompressorConfig::max_read_length_bytes`
+    传给解码器，逐条读长超过上限即返回格式错误；
+  - `memory_estimate_read_length()` 直接等于该上限（不再有「经验值」分支），
+    因此估算永远是上界。新增 `forged_short_class_with_long_reads_is_rejected`
+    回归（改 flags 分类位后 2000 bp 块必须被拒）。
+
+  **兼容性**：单条读长超过 4 MiB 的归档会被拒绝解码；真实测序读长（最长 ONT
+  约 2.5 Mbp）远低于该值。`--original-order` 对 Long 归档的估算变得更保守
+  （按上限而非经验值），必要时提高 `--memory-limit` 或走默认顺序输出。
+
+- 2026-11-08 ID 流解码上限收紧：exact/tokenize/legacy 三条路径的声明解码大小
+  从每 read 64 KiB 降到 4 KiB，并增加 512 MiB 绝对上限；伪造 `read_count`
+  的小归档不再能声明数百 GiB 的 ID 输出。新增 `ResourceLimit` 回归测试。
+- 2026-11-08 单块解码字节纳入预算：`decompress_raw` 在
+  `vec![ReadRecord; read_count]` 之前检查 `read_count × 96 B`，并在解出
+  `lengths` 后检查 `骨架 + 2 × 总碱基` 均不超过
+  `DecodeBudget::max_alloc_bytes`。此前 `read_count` 只与块索引/
+  `total_read_count`（按 32 B/read 估算）交叉校验，`--memory-limit 16` 下
+  500k reads 的构造归档会先分配约 48 MB 骨架（实测 RSS 超出约 35 MB）；
+  `uniform_read_length=0xFFFFFFFF` 还会让单条读段尝试 4 GiB 级分配。
+  `BlockCompressorConfig` 新增 `max_block_decoded_bytes`（默认
+  `u64::MAX`，压缩路径不限制），解压与 verify 从 reader budget 填充。
+  新增 3 条回归测试（骨架、伪造长度、端到端块预算）。
+- 2026-11-08 有界 zstd 解压不再按不可信上限预分配：`zstd_decompress_bounded`
+  改用流式解码器，初始容量仅 `min(max_out, 64 KiB)`，输出超过 `max_out` 时
+  返回 `ResourceLimit`。此前 `zstd::bulk::decompress` 会在帧头缺少
+  `Content_Size` 时按 `max_out` 预分配，约 3 KB 的构造 `.fqc`
+  （`uniform_read_length=0xFFFFFFFF`、`read_count=100000`）即可触发
+  `429496729900064` 字节分配并 abort，绕过 `--memory-limit`。新增
+  `zstd_bounded_does_not_preallocate_untrusted_ceiling` 回归测试。
+- 升级 `zstd` 到 0.14.3（`zstd-safe` 8.2.0、`zstd-sys` 2.1.2），修复
+  `RUSTSEC-2026-0391`、`RUSTSEC-2026-0398`、`RUSTSEC-2026-0403`、
+  `RUSTSEC-2026-0410`；未添加 advisory ignore。
+
+- 为当前无依赖的 note 工具补充最小 `package-lock.json`，替换 GitHub npm 依赖图中
+  残留的旧 VitePress 锁文件；`npm audit --package-lock-only` 返回 0 vulnerabilities。
+
+### Changed
+
+- 2026-11-08 `compress -i - -2 R2.fastq` 在参数阶段拒绝：stdin 只能提供一条
+  流，旧实现静默忽略 R2、生成缺少 mate 的归档并返回成功。新增
+  `stdin_with_second_input_is_rejected` 回归。
+- 2026-11-08 解压线程错误优先返回真实根因：reader/decoder/writer 全部 join
+  后再选择错误，跳过由其它线程失败引发的 `channel closed` 次生错误。
+
+
+- 解压配置映射收敛为 `DecompressionConfig::from(&DecompressSettings)`，
+  `api::decompress` 不再逐字段复制；`DecompressSettings` 文档同步为单一 pipeline。
+- 解压调度收敛到单一 `DecompressionPipeline`：删除 `decompression_classic`，
+  original-order、split-PE、range、header-only、skip-corrupted 全部由同一套
+  Reader→Decompressor→Writer 处理；`--pipeline` 保留为兼容别名。默认多块解压
+  略快、RSS 略低，单块小文件有轻微线程开销。
+- 解压输出层收敛到 `pipeline/decompression_writer`：单文件/stdout、split
+  R1/R2、header-only、corrupted placeholder、split 路径推导和事务提交只保留
+  一份；随后块调度也已统一到同一个 `DecompressionPipeline`。
+- 块大小与 worker 规划收敛到 `plan_compression_layout`：`CompressionPlanInput`
+  新增 `auto_split_long_reads`，archive/pipeline 传 true，streaming 传 false 保持
+  原有块大小；streaming 不再维护单独的 `effective_block_size` / worker 估算入口。
+- 输入字节统计收敛为 `stats::input_bytes_for` / `input_bytes_for_paths`，
+  streaming 与 pipeline 不再各自维护包装函数。
+- streaming 的块规划辅助从 `engine/common` 更名为 `streaming_support`（现在只服务
+  streaming）；解压 worker 自动上限复用 `plan::codec_thread_limit`，不再维护第二份
+  线程上限判断。
+- archive 与 pipeline 压缩收敛为同一个完整摄入 runner：读取、分类、重排、
+  flags、切块和统计只保留一份编排，删除 `archive_runner`；两种模式的归档体与
+  解压结果一致，`--pipeline` 保留模式标签与每块至少 100 读段的校验。
+- streaming 改用与 archive/pipeline 相同的块流水线：解析器按需供给块，压缩
+  worker 并行编码，写入器按 block id 顺序提交；只预取 1 个块，常驻内存仍与
+  输入大小无关。输出事务改为所有阶段成功后由主线程提交，解析中途失败不会
+  发布截断归档。370 MB / 16 块真实语料 release 冒烟从 6.9 s / 130 MB 变为
+  2.5 s / 约 575 MB（4 worker），`--memory-limit 512` 时为 2.9 s / 463 MB、
+  `--memory-limit 256` 时为 6.6 s / 218 MB；归档体与旧 streaming 逐字节一致。
+- 移除未实现的 `PipelineControl` 取消/进度状态；解压 pipeline 的退出条件只由
+  channel 关闭、worker 错误和事务完整性决定，热路径少一次原子读。
+- 移除 crate 根部的 compressor trait 再导出；`fqc::api` 是稳定入口，内部 trait
+  需从 `fqc::algo::compressor_traits` 导入。新增根级内部再导出守卫。
+- `GlobalAnalyzer` 直接接收 `&[ReadRecord]`，archive 与 pipeline 不再为了全局
+  分析复制整库 sequence；已知读长类别时跳过全量长度统计，并移动而非克隆
+  reorder map。100k 随机读段的 release 冒烟 archive 峰值 RSS 从约 139 MB 降到
+  约 121 MB。
+- archive 与 pipeline 共享同一套有界块级流水线：并行压缩、按 block id 顺序写入、
+  reorder map 和事务提交只保留一份实现；archive 不再在写盘前保留全部压缩块。
+  两种模式仍先完整摄入以支持全局分析/重排，因此这不是 bounded ingest。
+- pipeline 分块改为单次移动扫描，移除反复 `split_off` 造成的二次拷贝和超大
+  `Vec` 容量；100k 随机读段的 release 冒烟峰值 RSS 从约 565 MB 降到约 112 MB。
+- `CompressionSettings` 到 codec 配置的映射收敛为单一构造入口：archive 与
+  streaming 用 engine 的 `CodecProfile`，pipeline 用与类别无关的
+  `BlockCodecSettings`，摄入后再解析读长类别。
+- archive 与 pipeline 的完整摄入共用 `fastq::ingest` 的三个拓扑入口，stdin /
+  paired / interleaved 选择只保留一份实现；`engine` 只保留 streaming 的前缀
+  长度扫描。
+- `--scan-all-lengths` 改用长度直方图统计，内存从 O(reads) 降为
+  O(distinct lengths)，中位数语义与旧的排序实现逐值一致。
+
 ### Added
 
+- `fqc::api` 稳定嵌入 facade：`compress` / `decompress` / `info` / `verify` 四个入口，
+  请求类型通过私有字段 + `Validated*Plan` 校验；其它模块标记为 `#[doc(hidden)]` 的
+  internal API。新增 `docs/reference/library-api.md`。
+- `tests/test_architecture.rs`：用源码 import 守卫 `algo`/`archive` 只通过 `block` 交接，
+  并禁止 `io` / `fastq` / `memory` / `plan` 依赖更高层，防止 Rust 模块循环悄悄回退。
+- `OperationStats` 成为唯一统计真源；删除 `PipelineStats` / `ProcessingStats` 别名与
+  `CompressionOutcome` 的重复计数字段。`input_bytes` / `output_bytes` 使用实际文件字节，
+  `total_bases` 单独保留；`output_bytes` 由 writer finalize 返回真实归档大小。
+
+- `--reorder auto`（默认）：同时采样相邻重叠和全局共享 k-mer；已空间有序或没有可重排冗余的短读输入跳过重排，避免真实 WXS 与独立随机读段上的负收益；`--reorder true|false` 保持显式覆盖。重排 fallback 改为 `BTreeSet`，避免无共享 k-mer 输入上的 O(n²) 扫描。
+- `--block-reads`：显式指定每块读段数（`1..=1,000,000`，CLI 入口拦截超大块；`--pipeline` 仍要求至少 `100`）；`--max-block-bases` 扩展到所有读长类别。自动模式按实际 codec worker 上限的 `workers × 2` 目标块数、类别最小读段数和碱基上限定块（Long 默认 5 Mbp，其他类别 8 Mbp；streaming 不套自动长读切块）；内存受限导致 worker 减少时会重新放大 block，长读不再默认落入单 block。
+- 编解码 worker 内存上限：按 block 估算质量模型/记录/Zstd 缓冲，`--memory-limit` 可限制并行 worker；自动线程模式默认最多 4 个 worker。解压 worker 预算额外保留非 worker 内存，不再把完整限制全部用于 worker。
+- 阶段计时：compress / decompress 的 summary 打印 `Stage timings`（parse / reorder /
+  process / write，单位 ms；process 为并行 worker 聚合 CPU 时间）。覆盖 archive、pipeline、
+  streaming 三种模式，单 block 与 `--original-order` 路径同样计时。
+- 真实语料压缩/吞吐证据：`scripts/fetch_real_corpus.sh` + `docs/reference/real-corpus.md`
+  （ENA 两份公开切片，与 C++ 侧同语料同 sha256，round-trip 逐字节一致）；
+  `docs/reference/hotspot-report.md` 记录阶段热点与优化前后对比。
+- `--id-mode exact|tokenize|discard` on `compress` (default `tokenize`);
+  Exact never tokenizes, Tokenize may fall back per block, Discard writes
+  placeholder IDs. The chosen mode is stored in archive flags.
+- `--lossy-quality qvz` is a distinct 8-level nearest-neighbor quality
+  quantizer (`[7, 15, 20, 25, 30, 35, 40, 41]`) encoded with existing SCM,
+  not a lossless alias and not trained rate-distortion QVZ.
+- Archive compress ingest budget: `--memory-limit 0` resolves to a finite
+  automatic cap (same 75% / hard-ceiling policy as decode); running peak
+  estimate fails with `ResourceLimit` before the `.fqc` is created, and
+  `--streaming` skips this full-ingest check. `--pipeline` uses the same
+  ingest check (it is still not a bounded-memory streaming path).
+- Cross-family magic dispatch: reject C++ `fqc-sequential/v2` archives with an
+  explicit unsupported-format-family error pointing at
+  `open-genomics/fq-compressor` (unknown/truncated magics stay distinct).
+- Operation-scoped decode/verify memory budget (`DecodeBudget`): `--memory-limit`
+  applies to decompress and full verify; archive-declared sizes and zstd output
+  are capped before allocation; automatic (`0`) remains finite with hard
+  structural ceilings (not unlimited).
+- Header-driven per-stream codec dispatch on decompress: IDs/seq/qual/aux each
+  validate their block-header codec byte against an allow-list (unknown family,
+  wrong stream, and non-v0 versions fail closed); global quality/id mode must
+  not contradict the declared families.
+- Transactional ordinary-file output (`OutputTransaction`): compress and
+  decompress write same-directory temps and rename only after a successful
+  flush/close. Mid-run failure leaves a missing target absent, or keeps the
+  previous file when `-f/--force` was used. Stdout remains non-transactional;
+  `--split-pe` commits R1 then R2 (POSIX cannot atomically rename two paths).
+- Frozen indexed v2 decoder fixture (`tests/fixtures/indexed-v2/`) with
+  MANIFEST.md documenting generator commit, command, and SHA-256 hashes.
+- Format contract tests (`tests/test_format_contract.rs`) covering magic,
+  version, codec/checksum identifier encoding, frozen fixture round-trip,
+  and unknown-identifier rejection.
+- Benchmark foundation for parser and archive workflows (criterion-based),
+  plus performance hotspot documentation.
+- 轻量 CI（`.github/workflows/ci.yml`，GitHub Actions）：fmt / clippy / test /
+  doc 四门禁（`--locked`），push 与 PR 触发。
+- 治理文档：`SECURITY.md`（私有漏洞上报）、`CONTRIBUTING.md`、`VERSIONING.md`、
+  `.github/ISSUE_TEMPLATE/`（bug / feature 表单）。
+- `Cargo.toml` 补 `homepage` 字段；`openspec/project.md` 记录 `fqc-indexed/v2`
+  身份、决策 `FQC-DEC-001` 与外部边界。
+- 面防御测试：归档解码器对 frozen fixture 的全部截断点、逐字节单比特翻转与
+  确定性伪随机垃圾输入均不 panic（fail closed 的手工用例原由
+  `test_decode_budget` 覆盖，此处补穷举广度）；`FastqParser` 对随机与变异
+  FASTQ 输入不 panic。
+- `ZstdSequenceCompressor` 直接测试（roundtrip、空流、计数/长度不一致、长度
+  分歧、截断、尾随字节）；`AsyncWriter` 直接测试（字节顺序、flush 应答、
+  后台写失败传播）；`FqcReader::info()` 字段断言钉住 frozen fixture 的
+  MANIFEST 数字。
+
+- CI 增加原生 aarch64 job（GitHub 公共仓库免费 ARM runner）：release 构建 +
+  lib/集成测试，防止后续改动引入 x86-only 假设。
 - 阶段计时：compress / decompress 的 summary 打印 `Stage timings`（parse / reorder /
   process / write，单位 ms；process 为并行 worker 聚合 CPU 时间）。覆盖 archive、pipeline、
   streaming 三种模式，单 block 与 `--original-order` 路径同样计时。
@@ -61,6 +242,25 @@
 
 ### Changed
 
+- 架构边界收敛：新增 `block` 中立块域、`plan` 请求/校验/块规划、`memory` 三套预算、
+  `dna` 中性工具；`algo` 与 `archive` 不再互相依赖。`CompressionRequest` /
+  `DecompressRequest` 字段私有，`ReorderMode` 取代 `enable_reorder + auto_reorder`
+  布尔组合；`CompressionPipelineConfig` 删除 `streaming_mode`，重排策略统一为 enum。
+- `begin_fqc_writer` 从 `io` 移入 `archive::writer`，`io` 不再依赖归档格式；
+  global header / timestamp 写入收敛到 `archive::writer::write_global_header`。
+- `FqcReader` / 解压 pipeline / `VerifyOptions` / `ArchiveInfo.file_path` 改为 `Path`/`PathBuf`；`api::info`、`api::decompress` 不再经 `to_string_lossy`，非 UTF-8 路径可完整 round-trip。
+- `DecompressionPipelineConfig` 改名为 `DecompressionConfig`；compress `--pipeline`
+  的 CLI/文档表述改为“完整摄入后并行压缩块”，不再宣称 bounded streaming。
+- 质量自适应模型从 `Vec<u32>` 频率 + cumulative 数组改为 `u16` Fenwick 树，并进一步把每个上下文独立的 `Vec<u16>` 合并为连续 `trees`/`totals` 存储；order-2 的约 7 万个上下文现在只有两个大分配，编码输出保持逐字节一致，模型内存从约 57 MB 降到约 14 MB，更新从 O(94) 降到 O(log 94)。
+- 短读 ABC 上限从 4,096 条降到 512 条；ABC 的 O(n²) contig 扫描在 4k 条上实测约 25.9 s，而 Zstd 约 0.13 s，且该合成样本上无压缩收益。
+- 重排阶段复用首次并行提取的 minimizer，删除每条 read 的重复提取；aarch64
+  100k × 150 bp 合成短读上重排墙钟约降低 7%，解压内容与归档 payload 不变。
+- minimizer 提取改为 2-bit 滚动哈希 + 单调队列；同一微基准中提取阶段约
+  3.07 s → 0.27 s（约 11×），`k > 32` 仍保留旧线性路径以保证哈希边界不变。
+- Linux 自动内存预算现在同时参考 `/proc/meminfo` 与 cgroup v2/v1 的剩余内存额度；
+  容器内 `--memory-limit 0` 不再按宿主机内存高估，显式 `--memory-limit` 仍覆盖。
+- 长读 archive/pipeline 在 `--max-block-bases 0` 时按 5M bases/block 自动切块，
+  提升多核压缩/解压吞吐；显式值仍覆盖，streaming 不自动改块。
 - docs 按 Diátaxis 重组为 `tutorials/`、`how-to/`、`reference/`、`explanation/` 四象限，
   `docs/README.md` 改为按用户目标索引；`cli.md` 归入 `reference/`、`quick-start.md` 归入
   `tutorials/`、基准与测量报告归入 `reference/`；README 与 guide 重复的安装/常用命令/
@@ -73,8 +273,7 @@
   访问模型、对方链接），并新增同名二进制 `fqc` 的 `PATH` 覆盖风险提醒。对应 openspec
   变更 `document-fqc-format-family`（2026-10-01 归档，规格落为
   `openspec/specs/format-governance/`）。
-- README：新增 CI 徽章；"零 unsafe"表述修正为"除 Windows 内存探测外零 unsafe"
-  （`GlobalMemoryStatusEx` FFI 见 `src/memory_budget.rs`）。
+- README：新增 CI 徽章；“零 unsafe”保持成立（`unsafe_code = "deny"`；Windows 内存探测已移除）。
 - docs 卫生：功能对比矩阵 / 学术文献 / 执行模式说明单源化（分别收敛到
   `docs/explanation/comparison.md`、`docs/explanation/whitepaper.md`、
   `docs/how-to/modes.md`）；白皮书修正 src 树、测试数（215，2026-08 实测）与重排说明；
@@ -111,6 +310,25 @@
 
 ### Fixed
 
+- ABC 解码按偏移方向校验重叠：正向 shift 与当前共识长度比较，负向 shift 才与
+  读段长度比较。此前 `|offset| >= read_length` 会拒绝编码器为短读段产生的
+  正向对齐（例如 10 bp 读段落在 58 bp 共识 offset 20），归档压缩成功却无法
+  解压或通过 verify；新增单元与端到端回归测试。
+- gzip/bzip2/xz 输入改用多 member/多流解码器。此前只解压第一个 member：
+  `cat a.fastq.gz b.fastq.gz`、BGZF 等合法多 member 输入会被 gzip/bzip2
+  静默截断，xz 串联则直接报错；新增三种格式的串联回归测试。
+- 块流水线按 `Root < Panicked < Derived` 报告阶段错误：writer 的 I/O 根因
+  不再被 reader/compressor 的 channel closed 症状覆盖，compressor 的编码错误
+  也不再被 writer 的“块数不足”覆盖；新增输出目录不存在的回归测试。
+- pipeline 读长分类改为完整摄入后统一执行，删除“只预扫描前 4,096 条”的路径。
+  长读只出现在尾部时，archive 与 pipeline 现在得到相同的 class、block size、
+  worker 数和块数；通过 API 构造的 stdin pipeline 也按实际读段分类（CLI 仍把
+  stdin 强制转为 streaming），`--scan-all-lengths` 不再需要额外预扫描一遍文件。真实 Illumina / Nanopore / paired mito 数据的
+  archive/pipeline/streaming round-trip 均与输入逐字节一致。
+- streaming 交错输入的长度采样在达到上限后立即停止，不再解析完整文件却只保留
+  前 4,096 条长度。
+- streaming 模式此前 `parse_ms` / `process_ms` / `write_ms` 全为 0，CLI summary
+  的阶段计时对 streaming 无效；现在按实际 parser / compressor / writer 操作累计。
 - 加固 indexed v2 解码边界：恢复历史无损块校验和语义，有损/丢弃块不再携带
   不可能匹配的逻辑校验和；ABC V3 使用 codec `0x11`，并严格校验载荷版本、计数、
   映射、偏移、UTF-8 与尾随字节；Zstd、辅助流、ID 流和算术质量流拒绝截断或不一致数据。

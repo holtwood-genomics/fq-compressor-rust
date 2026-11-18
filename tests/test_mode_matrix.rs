@@ -2,7 +2,7 @@
 // fqc-rust - Compression/Decompression Mode Matrix Tests
 // =============================================================================
 // One explicit cell per {single, paired, interleaved} × {archive, streaming,
-// pipeline}: compress, verify, decompress (classic path), and assert content
+// pipeline}: compress, verify, decompress, and assert content
 // integrity plus info totals. These pin the observable semantics of every
 // execution path before/while the code paths are being consolidated.
 // =============================================================================
@@ -12,7 +12,9 @@ use std::path::Path;
 use fqc::commands::compress::{CompressCommand, CompressOptions};
 use fqc::commands::decompress::{DecompressCommand, DecompressOptions};
 use fqc::commands::verify::{VerifyCommand, VerifyOptions};
+use fqc::engine::compression_engine::CompressionEngine;
 use fqc::fastq::parser::FastqParser;
+use fqc::plan::CompressionExecutionMode;
 use fqc::types::ReadRecord;
 
 // =============================================================================
@@ -146,7 +148,7 @@ fn run_matrix_cell(topology: &Topology, mode: &Mode) {
     assert_eq!(code, 0, "compress failed for {topology:?} × {mode:?}");
 
     let verify_code = VerifyCommand::new(VerifyOptions {
-        input_path: archive.clone(),
+        input_path: archive.clone().into(),
         ..Default::default()
     })
     .execute();
@@ -237,35 +239,23 @@ matrix_test!(interleaved_streaming, Topology::Interleaved, Mode::Streaming);
 matrix_test!(interleaved_pipeline, Topology::Interleaved, Mode::Pipeline);
 
 // =============================================================================
-// Cross-path equivalence: classic vs pipeline decompression must agree
+// Range extraction semantics
 // =============================================================================
 
-fn decompress_once(archive: &str, out: &Path, use_pipeline: bool) {
-    let code = DecompressCommand::new(DecompressOptions {
-        input_path: archive.to_string(),
-        output_path: out.to_string_lossy().into_owned(),
-        use_pipeline,
-        force_overwrite: true,
-        ..Default::default()
-    })
-    .execute();
-    assert_eq!(code, 0);
-}
-
 #[test]
-fn range_extraction_agrees_between_classic_and_pipeline_paths() {
+fn range_extraction_selects_expected_reads() {
     let case = build_case(&Topology::Single, &Mode::Archive);
     let code = CompressCommand::new(case.opts.clone()).execute();
     assert_eq!(code, 0);
     let archive = case.opts.output_path.clone();
 
     for (start, end) in [(2u64, 4u64), (1, 1), (19, 25), (5, 0)] {
-        let classic = case.dir.path().join(format!("classic_{start}_{end}.fastq"));
+        let out = case.dir.path().join(format!("range_{start}_{end}.fastq"));
         let piped = case.dir.path().join(format!("pipe_{start}_{end}.fastq"));
 
         let c1 = DecompressCommand::new(DecompressOptions {
             input_path: archive.clone(),
-            output_path: classic.to_string_lossy().into_owned(),
+            output_path: out.to_string_lossy().into_owned(),
             range_start: start,
             range_end: end,
             force_overwrite: true,
@@ -284,7 +274,7 @@ fn range_extraction_agrees_between_classic_and_pipeline_paths() {
         .execute();
         assert_eq!((c1, c2), (0, 0), "range {start}:{end} exit codes diverge");
 
-        let a = parse_fastq(&classic);
+        let a = parse_fastq(&out);
         let b = parse_fastq(&piped);
         assert_eq!(
             a.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
@@ -311,23 +301,107 @@ fn range_extraction_agrees_between_classic_and_pipeline_paths() {
     }
 }
 
+// =============================================================================
+// Streaming block pipeline
+// =============================================================================
+
+/// Streaming now shares the block pipeline: multiple blocks compress in
+/// parallel and must still be written and restored in input order.
 #[test]
-fn pipeline_decompress_matches_classic_on_archive_and_streaming_inputs() {
-    for mode in [Mode::Archive, Mode::Streaming] {
-        let case = build_case(&Topology::Single, &mode);
-        let code = CompressCommand::new(case.opts.clone()).execute();
-        assert_eq!(code, 0);
-        let archive = case.opts.output_path.clone();
+fn streaming_parallel_blocks_keep_order_and_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let reads = make_records("m", 250, 80);
+    let input = dir.path().join("multi.fastq");
+    write_fastq(&input, &reads);
+    let archive = dir.path().join("multi.fqc");
 
-        let a_path = case.dir.path().join("classic.fastq");
-        let b_path = case.dir.path().join("piped.fastq");
-        decompress_once(&archive, &a_path, false);
-        decompress_once(&archive, &b_path, true);
+    let opts = CompressOptions {
+        input_path: input.to_string_lossy().into_owned(),
+        output_path: archive.to_string_lossy().into_owned(),
+        streaming_mode: true,
+        block_size: 100,
+        threads: 2,
+        force_overwrite: true,
+        show_progress: false,
+        ..Default::default()
+    };
+    let outcome = CompressionEngine::new().run(opts.to_request()).unwrap();
+    assert_eq!(outcome.mode, CompressionExecutionMode::Streaming);
+    assert_eq!(outcome.stats.blocks, 3, "250 reads at 100 reads/block");
+    assert_eq!(outcome.stats.total_reads, reads.len() as u64);
 
-        assert_eq!(
-            sorted_content(&parse_fastq(&a_path)),
-            sorted_content(&parse_fastq(&b_path)),
-            "classic and pipeline decompression disagree for {mode:?}"
-        );
+    let restored = dir.path().join("multi.out.fastq");
+    let code = DecompressCommand::new(DecompressOptions {
+        input_path: archive.to_string_lossy().into_owned(),
+        output_path: restored.to_string_lossy().into_owned(),
+        force_overwrite: true,
+        ..Default::default()
+    })
+    .execute();
+    assert_eq!(code, 0);
+
+    let got = parse_fastq(&restored);
+    assert_eq!(got.len(), reads.len());
+    assert_eq!(
+        got.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+        reads.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+        "streaming must write blocks in input order"
+    );
+    assert_eq!(sorted_content(&got), sorted_content(&reads));
+}
+
+// =============================================================================
+// Full-ingest convergence
+// =============================================================================
+
+/// Archive and pipeline share one full-ingest implementation. Pin that the two
+/// mode labels still produce the same block layout and decompressed content.
+#[test]
+fn archive_and_pipeline_share_full_ingest_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let reads = make_records("c", 220, 100);
+    let input = dir.path().join("converge.fastq");
+    write_fastq(&input, &reads);
+
+    let mut archives = Vec::new();
+    for (suffix, use_pipeline) in [("archive", false), ("pipeline", true)] {
+        let archive = dir.path().join(format!("{suffix}.fqc"));
+        let code = CompressCommand::new(CompressOptions {
+            input_path: input.to_string_lossy().into_owned(),
+            output_path: archive.to_string_lossy().into_owned(),
+            use_pipeline,
+            block_size: 100,
+            threads: 2,
+            force_overwrite: true,
+            show_progress: false,
+            ..Default::default()
+        })
+        .execute();
+        assert_eq!(code, 0, "{suffix} compression failed");
+
+        let restored = dir.path().join(format!("{suffix}.fastq"));
+        let code = DecompressCommand::new(DecompressOptions {
+            input_path: archive.to_string_lossy().into_owned(),
+            output_path: restored.to_string_lossy().into_owned(),
+            force_overwrite: true,
+            ..Default::default()
+        })
+        .execute();
+        assert_eq!(code, 0, "{suffix} decompression failed");
+        archives.push((archive, restored));
     }
+
+    let a_reader = fqc::archive::reader::FqcReader::open(&archives[0].0).unwrap();
+    let p_reader = fqc::archive::reader::FqcReader::open(&archives[1].0).unwrap();
+    assert_eq!(a_reader.block_count(), p_reader.block_count());
+    assert_eq!(a_reader.info().total_reads, p_reader.info().total_reads);
+    drop(a_reader);
+    drop(p_reader);
+
+    assert_eq!(
+        std::fs::read(&archives[0].1).unwrap(),
+        std::fs::read(&archives[1].1).unwrap(),
+        "archive and pipeline must decode to the same FASTQ"
+    );
+    assert_eq!(sorted_content(&parse_fastq(&archives[0].1)), sorted_content(&reads));
 }

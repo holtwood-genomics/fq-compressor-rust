@@ -16,9 +16,9 @@ flowchart TD
     G --> H[可选重排]
     H --> I[最优压缩]
     
-    D --> J[增量读取]
-    J --> K[直接压缩]
-    K --> L[低内存]
+    D --> J[按块增量读取]
+    J --> K[并行块压缩]
+    K --> L[有界低内存]
     
     E --> M[并发流水线]
     M --> N[读取器 → 压缩器 → 写入器]
@@ -30,11 +30,15 @@ flowchart TD
 | 特性 | Archive | Streaming | Pipeline |
 |------|---------|-----------|----------|
 | **标志** | (默认) | `--streaming` | `--pipeline` |
-| **内存占用** | 高 | 低 | 中 |
-| **重排** | 是 | 否 | 有限 |
-| **压缩率** | 最佳 | 良好 | 良好 |
-| **吞吐量** | 中 | 高 | 最高 |
-| **适用场景** | 最佳压缩率 | 大文件、内存受限 | 并发处理 |
+| **内存占用** | 高 | 低 | 高（与 archive 相同） |
+| **重排** | 是 | 否 | 是（与 archive 相同） |
+| **压缩率** | 最佳 | 良好 | 最佳（与 archive 相同） |
+| **吞吐量** | 高 | 高 | 高（与 archive 相同） |
+| **适用场景** | 最佳压缩率 | 大文件、内存受限 | 显式完整摄入模式 |
+
+> 压缩侧 archive 与 pipeline 自 2026-11-06 起共享同一完整摄入实现，归档结果一致；
+> `--pipeline` 保留为显式模式，并保留其块大小下限校验。解压侧也已统一为
+> Reader→Decompressor→Writer 三阶段管道，`--pipeline` 是兼容别名。
 
 ## Archive 模式（默认）
 
@@ -64,15 +68,16 @@ fqc compress -i reads.fastq -o reads.fqc --streaming
 ```
 
 **特点**：
-- 单遍增量处理
+- 单遍增量处理：解析器按需产出一个块，不缓存全量输入
 - 无全局重排
-- 严格内存控制
-- 快速处理
+- 压缩块阶段与 archive/pipeline 共享，可并行编码块
+- 有界内存：只保留预取块、正在压缩的块和少量已压缩块
 
 **内存行为**：
-- 恒定内存占用
-- 与输入大小无关
-- 适合流式管道
+- 常驻内存与输入大小无关
+- 峰值由块大小、worker 数和预取深度决定（streaming 预取 1 个块）
+- worker 数受 `--threads` 与 `--memory-limit` 约束；显式降低内存上限会同时减少 worker
+- 适合流式管道和超大文件
 
 ## Pipeline 模式
 
@@ -83,10 +88,10 @@ fqc compress -i reads.fastq -o reads.fqc --pipeline
 ```
 
 **特点**：
-- 分段并发执行
-- 读取器 → 压缩器 → 写入器流水线
-- 块缓冲在途
-- 高吞吐量
+- 压缩侧与 archive 共享完整摄入实现：读取器 → 压缩器 → 写入器
+- 完整摄入后，压缩块阶段有界缓冲
+- 保留 `--pipeline` 的块大小下限（≥100 读段/块）
+- 解压侧统一使用三阶段管道，`--pipeline` 为兼容别名
 
 **架构**：
 
@@ -108,6 +113,7 @@ flowchart LR
 - **compress archive**：摄入时估计峰值（含额外拷贝因子），超限失败并提示 `--streaming`
 - **compress streaming**：不走全量摄入检查
 - **compress pipeline**：与 archive 共用摄入峰值预算，超限同样失败；仍不是块级流式低内存路径
+- Linux 自动预算会取宿主机 `MemAvailable` 与 cgroup v2/v1 剩余额度的较小值；容器内仍建议对超大文件显式设置 `--memory-limit`
 
 ```bash
 # 显式限制 MB（archive 超预算会失败）
@@ -122,6 +128,7 @@ fqc --memory-limit 0 compress -i reads.fastq -o reads.fqc
 | 场景 | 推荐命令 |
 |------|----------|
 | 标准压缩 | `fqc compress -i in.fq -o out.fqc` |
-| 大文件、内存有限 | `fqc compress -i in.fq -o out.fqc --streaming --memory-limit 1024` |
+| 大文件、内存有限 | `fqc --memory-limit 1024 compress -i in.fq -o out.fqc --streaming` |
+| 长读 | `fqc compress -i long.fq -o out.fqc`（默认自动分块；可用 `--max-block-bases` 覆盖） |
 | 最大吞吐量 | `fqc compress -i in.fq -o out.fqc --pipeline` |
 | 双端输入 | `fqc compress -i R1.fq -2 R2.fq -o out.fqc` |

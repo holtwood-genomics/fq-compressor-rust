@@ -11,7 +11,7 @@
 //! Best suited for short reads (≤511 bp) where reads have high similarity.
 
 use crate::algo::compressor_traits::SequenceCompressor;
-use crate::algo::dna::{is_valid_base, reverse_complement, BASE_TO_INDEX, INDEX_TO_BASE};
+use crate::dna::{is_valid_base, reverse_complement, BASE_TO_INDEX, INDEX_TO_BASE};
 use crate::error::{FqcError, Result};
 use crate::types::{encode_codec, CodecFamily, ReadRecord, SPRING_MAX_READ_LENGTH};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -44,8 +44,10 @@ fn normalize_legacy_noise_char(c: u8) -> u8 {
     }
 }
 
-/// Short-read ABC packing becomes quadratic in block size, so larger blocks fall back to Zstd.
-pub const SHORT_READ_ABC_MAX_READS: usize = 4_096;
+/// Short-read ABC packing becomes quadratic in block size. Keep this path
+/// limited to tiny blocks until seeding replaces the O(n²) contig scan; larger
+/// blocks use Zstd (see `docs/explanation/algorithms/overview.md`).
+pub const SHORT_READ_ABC_MAX_READS: usize = 512;
 const MAX_ABC_DECODED_BYTES_PER_READ: usize = 4_096;
 
 // =============================================================================
@@ -599,9 +601,20 @@ fn decode_contig(
                 "ABC read length {read_length} exceeds short-read limit {SPRING_MAX_READ_LENGTH}"
             )));
         }
-        if (read_length == 0 && position_offset != 0)
-            || (read_length > 0 && position_offset.unsigned_abs() as usize >= read_length as usize)
-        {
+        // Encoder contract: `find_best_alignment` only yields a forward shift
+        // smaller than the consensus length at alignment time (the consensus
+        // only grows, so it stays smaller than the final consensus length) and
+        // a negative shift shorter than the read. Check the same directional
+        // bounds; `|offset| >= read_length` alone would reject valid forward
+        // shifts for reads shorter than their offset within the consensus.
+        let no_overlap = if read_length == 0 {
+            position_offset != 0
+        } else if position_offset >= 0 {
+            position_offset as usize >= consensus.len()
+        } else {
+            position_offset.unsigned_abs() as usize >= read_length as usize
+        };
+        if no_overlap {
             return Err(FqcError::Format(format!(
                 "ABC alignment offset {position_offset} has no read overlap"
             )));
@@ -788,7 +801,7 @@ impl AbcCompressor {
             .saturating_mul(MAX_ABC_DECODED_BYTES_PER_READ)
             .saturating_add(4096)
             .max(256);
-        let buf = crate::memory_budget::zstd_decompress_bounded(data, max_out, "abc sequences")?;
+        let buf = crate::memory::zstd_decompress_bounded(data, max_out, "abc sequences")?;
         let mut sequences = vec![String::new(); read_count as usize];
         let mut seen = vec![false; read_count as usize];
         let mut decoded_reads = 0usize;
@@ -996,6 +1009,26 @@ mod tests {
     }
 
     #[test]
+    fn test_abc_short_read_forward_offset_roundtrip() {
+        // The 10 bp read is a substring of the 58 bp read at offset 20. Its
+        // forward shift is larger than the short read's length but still
+        // overlaps the consensus, so the decoder must accept it.
+        let compressor = AbcCompressor::with_defaults();
+        let long = "ACGTTGCAAGTCCTAGGATCCGATGCTAGCTAGGCTAACGTTAGGCATCGATCGTACG";
+        let short = &long[20..30];
+        assert_eq!(short, "CGATGCTAGC");
+        let reads = vec![
+            make_read("r1", long, &"I".repeat(long.len())),
+            make_read("r2", short, &"I".repeat(short.len())),
+        ];
+
+        let encoded = compressor.compress(&reads).unwrap();
+        let decoded = compressor.decompress(&encoded.data, 2).unwrap();
+
+        assert_eq!(decoded, vec![long.to_string(), short.to_string()]);
+    }
+
+    #[test]
     fn test_abc_preserves_order() {
         let compressor = AbcCompressor::with_defaults();
         let reads = vec![
@@ -1026,7 +1059,7 @@ mod tests {
         );
 
         let decoded = compressor.decompress(&encoded.data, 0).unwrap();
-        assert!(decoded.is_empty());
+        assert_eq!(decoded, [] as [String; 0]);
     }
 
     #[test]

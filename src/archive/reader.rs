@@ -2,15 +2,16 @@
 // fqc-rust - FQC Archive Reader
 // =============================================================================
 
-use crate::algo::block_compressor::delta_decode_ids;
 use crate::archive::format::{self, *};
-use crate::archive::traits::BlockData;
+use crate::block::id_codec::delta_decode_ids;
+use crate::block::{BlockMeta, EncodedBlock};
 use crate::error::{FqcError, Result};
-use crate::memory_budget::{zstd_decompress_bounded, DecodeBudget};
+use crate::memory::{zstd_decompress_bounded, DecodeBudget};
 use crate::types::{IdMode, PeLayout, QualityMode, ReadLengthClass};
 use byteorder::ReadBytesExt;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 
 // =============================================================================
 // ArchiveInfo
@@ -19,7 +20,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 /// Structured information about an archive.
 #[derive(Debug, Clone)]
 pub struct ArchiveInfo {
-    pub file_path: String,
+    pub file_path: PathBuf,
     pub file_size: u64,
     pub total_reads: u64,
     pub num_blocks: usize,
@@ -40,7 +41,7 @@ pub struct ArchiveInfo {
 // =============================================================================
 
 pub struct FqcReader {
-    path: String,
+    path: PathBuf,
     reader: BufReader<File>,
     pub global_header: GlobalHeader,
     pub footer: FileFooter,
@@ -48,15 +49,18 @@ pub struct FqcReader {
     pub file_size: u64,
     pub reorder_forward: Option<Vec<u64>>,
     pub reorder_reverse: Option<Vec<u64>>,
+    /// Shared length across all blocks, when every block declares one.
+    pub uniform_read_length: Option<u32>,
     budget: DecodeBudget,
 }
 
 impl FqcReader {
-    pub fn open(path: &str) -> Result<Self> {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_budget(path, DecodeBudget::automatic())
     }
 
-    pub fn open_with_budget(path: &str, budget: DecodeBudget) -> Result<Self> {
+    pub fn open_with_budget(path: impl AsRef<Path>, budget: DecodeBudget) -> Result<Self> {
+        let path = path.as_ref();
         let file = File::open(path).map_err(FqcError::Io)?;
         let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
         let mut reader = BufReader::new(file);
@@ -117,10 +121,11 @@ impl FqcReader {
             )));
         }
         Self::validate_block_index(&block_index, header_end, &footer, global_header.total_read_count)?;
-        Self::validate_block_headers(&mut reader, &block_index, &footer)?;
+        let read_length_class = crate::archive::format::get_read_length_class(global_header.flags);
+        let uniform_read_length = Self::validate_block_headers(&mut reader, &block_index, &footer, read_length_class)?;
 
         Ok(Self {
-            path: path.to_string(),
+            path: path.to_path_buf(),
             reader,
             global_header,
             footer,
@@ -128,6 +133,7 @@ impl FqcReader {
             file_size,
             reorder_forward: None,
             reorder_reverse: None,
+            uniform_read_length,
             budget,
         })
     }
@@ -243,7 +249,9 @@ impl FqcReader {
         reader: &mut BufReader<File>,
         block_index: &BlockIndex,
         footer: &FileFooter,
-    ) -> Result<()> {
+        read_length_class: ReadLengthClass,
+    ) -> Result<Option<u32>> {
+        let mut uniform_length = Some(0u32);
         let block_region_end = if footer.has_reorder_map() {
             footer.reorder_map_offset
         } else {
@@ -253,6 +261,27 @@ impl FqcReader {
         for (idx, entry) in block_index.entries.iter().enumerate() {
             reader.seek(SeekFrom::Start(entry.offset))?;
             let header = BlockHeader::read(reader)?;
+            let length = header.uniform_read_length;
+            // 读长分类来自全局头 flags（不可信）。解压预算（worker 数、
+            // --original-order 峰值）由分类上限推导，所以这里先校验声明长度
+            // 与分类一致：伪造"短读"分类却声明超长读的归档直接拒绝，
+            // 否则分类上限会变成低估。
+            let class_ceiling = read_length_class.max_read_length() as u32;
+            if length > class_ceiling {
+                return Err(FqcError::Format(format!(
+                    "block {idx} uniform read length {length} exceeds the {} class limit {class_ceiling}",
+                    read_length_class.as_str()
+                )));
+            }
+            if !header.has_uniform_length() {
+                uniform_length = None;
+            } else {
+                match uniform_length {
+                    Some(0) => uniform_length = Some(length),
+                    Some(current) if current == length => {}
+                    _ => uniform_length = None,
+                }
+            }
 
             if header.block_id != idx as u32 {
                 return Err(FqcError::Format(format!(
@@ -346,7 +375,7 @@ impl FqcReader {
             }
         }
 
-        Ok(())
+        Ok(uniform_length.filter(|length| *length > 0))
     }
 
     pub fn block_count(&self) -> usize {
@@ -365,6 +394,21 @@ impl FqcReader {
             .map(|e| e.compressed_size)
             .max()
             .unwrap_or(0)
+    }
+
+    /// Exact read length shared by every block, if the archive declares one.
+    pub fn uniform_read_length(&self) -> Option<u32> {
+        self.uniform_read_length
+    }
+
+    /// Read length to use when estimating decode worker memory.
+    ///
+    /// A uniform archive gives the exact value. Otherwise the class ceiling is
+    /// the best signal available without scanning individual block payloads.
+    pub fn memory_estimate_read_length(&self) -> usize {
+        self.uniform_read_length
+            .map(|length| usize::try_from(length).unwrap_or(usize::MAX))
+            .unwrap_or_else(|| get_read_length_class(self.global_header.flags).memory_estimate_read_length())
     }
 
     /// Get structured information about this archive.
@@ -523,7 +567,7 @@ impl FqcReader {
     }
 
     /// Read a block by its block_id. Loads all streams.
-    pub fn read_block(&mut self, block_id: u32) -> Result<BlockData> {
+    pub fn read_block(&mut self, block_id: u32) -> Result<EncodedBlock> {
         let entry = self
             .block_index
             .entries
@@ -549,8 +593,17 @@ impl FqcReader {
             .ok_or_else(|| FqcError::Format(format!("Block {block_id} payload start overflows u64")))?;
         let payload_extent = bh.compressed_size;
 
-        let mut block_data = BlockData {
-            header: bh.clone(),
+        let mut block_data = EncodedBlock {
+            meta: BlockMeta {
+                block_id: bh.block_id,
+                read_count: bh.uncompressed_count,
+                uniform_read_length: bh.uniform_read_length,
+                block_checksum: bh.block_xxhash64,
+                codec_ids: bh.codec_ids,
+                codec_seq: bh.codec_seq,
+                codec_qual: bh.codec_qual,
+                codec_aux: bh.codec_aux,
+            },
             ..Default::default()
         };
 
@@ -559,8 +612,8 @@ impl FqcReader {
                 .checked_add(bh.offset_ids)
                 .ok_or_else(|| FqcError::Format(format!("Block {block_id} ids offset overflows u64")))?;
             self.reader.seek(SeekFrom::Start(ids_offset))?;
-            block_data.ids_data = self.alloc_stream(bh.size_ids, &format!("block {block_id} ids"), payload_extent)?;
-            self.reader.read_exact(&mut block_data.ids_data)?;
+            block_data.id_stream = self.alloc_stream(bh.size_ids, &format!("block {block_id} ids"), payload_extent)?;
+            self.reader.read_exact(&mut block_data.id_stream)?;
         }
 
         if bh.size_seq > 0 {
@@ -568,8 +621,8 @@ impl FqcReader {
                 .checked_add(bh.offset_seq)
                 .ok_or_else(|| FqcError::Format(format!("Block {block_id} seq offset overflows u64")))?;
             self.reader.seek(SeekFrom::Start(seq_offset))?;
-            block_data.seq_data = self.alloc_stream(bh.size_seq, &format!("block {block_id} seq"), payload_extent)?;
-            self.reader.read_exact(&mut block_data.seq_data)?;
+            block_data.seq_stream = self.alloc_stream(bh.size_seq, &format!("block {block_id} seq"), payload_extent)?;
+            self.reader.read_exact(&mut block_data.seq_stream)?;
         }
 
         if bh.size_qual > 0 {
@@ -577,9 +630,9 @@ impl FqcReader {
                 .checked_add(bh.offset_qual)
                 .ok_or_else(|| FqcError::Format(format!("Block {block_id} qual offset overflows u64")))?;
             self.reader.seek(SeekFrom::Start(qual_offset))?;
-            block_data.qual_data =
+            block_data.qual_stream =
                 self.alloc_stream(bh.size_qual, &format!("block {block_id} qual"), payload_extent)?;
-            self.reader.read_exact(&mut block_data.qual_data)?;
+            self.reader.read_exact(&mut block_data.qual_stream)?;
         }
 
         if bh.size_aux > 0 {
@@ -587,8 +640,8 @@ impl FqcReader {
                 .checked_add(bh.offset_aux)
                 .ok_or_else(|| FqcError::Format(format!("Block {block_id} aux offset overflows u64")))?;
             self.reader.seek(SeekFrom::Start(aux_offset))?;
-            block_data.aux_data = self.alloc_stream(bh.size_aux, &format!("block {block_id} aux"), payload_extent)?;
-            self.reader.read_exact(&mut block_data.aux_data)?;
+            block_data.aux_stream = self.alloc_stream(bh.size_aux, &format!("block {block_id} aux"), payload_extent)?;
+            self.reader.read_exact(&mut block_data.aux_stream)?;
         }
 
         Ok(block_data)

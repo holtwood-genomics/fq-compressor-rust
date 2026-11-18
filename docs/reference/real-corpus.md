@@ -1,10 +1,16 @@
 # 真实语料压缩/吞吐证据
 
+> 历史说明：文中 “默认 reorder” 指 2026-08 的旧默认。2026-11 起默认 `--reorder auto`：空间有序短读会自动跳过重排；表中 `--reorder false` 行仍可作为该路径的参考。
+
 收尾关账测量：用两份公开 FASTQ 前缀切片（与 C++ 侧 `fq-compressor/docs/real-corpus.md` **同一切片、同一 sha256**）
 验证 Rust 端 round-trip 无损、压缩比与吞吐，并给出 C++ 横向参考。切片不入库，用 `scripts/fetch_real_corpus.sh` 重建。
 
 环境：WSL2（Linux 6.18 / 12 核），Rust release 构建，`--threads 8`，默认压缩级别。共享机器、测量期间有并发任务，
 墙钟波动 ±20–30%（与 C++ 侧一样只用来下结论，不作 A/B 基准）。吞吐按未压缩 FASTQ 字节 / 墙钟。
+
+> **2026-10-26 说明**：长读 archive/pipeline 现在默认按 5M bases/block 自动切块；
+> 下表中 ONT 的 1 block 是旧默认配置的测量值，仍可用于 round-trip 与压缩比参考，
+> 但不再代表当前默认的块数或吞吐。streaming 未自动改块。
 
 ## 切片
 

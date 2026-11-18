@@ -15,7 +15,7 @@ use fqc::types::*;
 fn test_id_compress_decompress_exact() {
     let ids = vec!["read_0", "read_1", "read_2", "read_3", "read_4"];
     let compressed = compress_ids(&ids, 3, IdMode::Tokenize).unwrap();
-    assert!(!compressed.is_empty());
+    assert_ne!(compressed, Vec::<u8>::new());
 
     let decompressed = decompress_ids(&compressed, 5, "read").unwrap();
     assert_eq!(decompressed.len(), 5);
@@ -33,7 +33,7 @@ fn test_id_compress_decompress_discard() {
     assert_eq!(decompressed.len(), 3);
     // Discarded IDs should be synthetic placeholders
     for id in &decompressed {
-        assert!(!id.is_empty());
+        assert_ne!(id, "");
     }
 }
 
@@ -42,7 +42,7 @@ fn test_id_compress_decompress_empty() {
     let ids: Vec<&str> = vec![];
     let compressed = compress_ids(&ids, 3, IdMode::Tokenize).unwrap();
     let decompressed = decompress_ids(&compressed, 0, "").unwrap();
-    assert!(decompressed.is_empty());
+    assert_eq!(decompressed, Vec::<String>::new());
 }
 
 #[test]
@@ -90,6 +90,57 @@ fn test_id_compress_single() {
 // =============================================================================
 
 #[test]
+fn test_quality_compressed_bytes_are_stable_across_model_layout() {
+    // A fixed sample that exercises position bins, context transitions, and
+    // rescaling-adjacent updates. The quality stream must not change when the
+    // context table moves from per-context Vecs to one flat allocation.
+    let qualities = [
+        "IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII",
+        "!!!!!!!#######IIIIIII~~~~~~~JJJJJJ!!!!",
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdef",
+        "IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII",
+        "##########!!!!!!!!!!IIIIIIIIIIJJJJJJJJ",
+    ];
+    let refs: Vec<&str> = qualities.to_vec();
+    let config = QualityCompressorConfig {
+        quality_mode: QualityMode::Lossless,
+        ..Default::default()
+    };
+    let mut compressor = QualityCompressor::new(config);
+    let compressed = compressor.compress(&refs).unwrap();
+    assert_eq!(
+        xxhash_rust::xxh64::xxh64(&compressed, 0),
+        0x839f_c7ef_bf59_b7d3,
+        "flat context storage must preserve the quality stream byte-for-byte"
+    );
+}
+
+#[test]
+fn test_quality_rescale_path_stays_stable() {
+    // 600 * 40 = 24,000 encoded symbols, above MAX_FREQUENCY (16,383), so
+    // this sample exercises per-context rescale in addition to normal updates.
+    let qualities: Vec<String> = (0..600)
+        .map(|i| (0..40).map(|j| (33 + ((i * 17 + j * 7) % 94)) as u8 as char).collect())
+        .collect();
+    let refs: Vec<&str> = qualities.iter().map(|quality| quality.as_str()).collect();
+    let config = QualityCompressorConfig {
+        quality_mode: QualityMode::Lossless,
+        ..Default::default()
+    };
+    let mut compressor = QualityCompressor::new(config.clone());
+    let compressed = compressor.compress(&refs).unwrap();
+    let lengths: Vec<u32> = qualities.iter().map(|quality| quality.len() as u32).collect();
+    let mut decompressor = QualityCompressor::new(config);
+    let restored = decompressor.decompress(&compressed, &lengths).unwrap();
+    assert_eq!(restored, qualities);
+    assert_eq!(
+        xxhash_rust::xxh64::xxh64(&compressed, 0),
+        0xaa42_2204_a59b_b473,
+        "rescale path must keep the quality stream byte-for-byte stable"
+    );
+}
+
+#[test]
 fn test_quality_compress_decompress_lossless() {
     let qualities = ["IIIIIIIII!", "!!!!IIIII!", "~~~~!!!!II"];
     let lengths: Vec<u32> = qualities.iter().map(|q| q.len() as u32).collect();
@@ -101,7 +152,7 @@ fn test_quality_compress_decompress_lossless() {
     };
     let mut compressor = QualityCompressor::new(config.clone());
     let compressed = compressor.compress(&refs).unwrap();
-    assert!(!compressed.is_empty());
+    assert_ne!(compressed, Vec::<u8>::new());
 
     let mut decompressor = QualityCompressor::new(config);
     let decompressed = decompressor.decompress(&compressed, &lengths).unwrap();
@@ -122,7 +173,7 @@ fn test_quality_compress_decompress_discard() {
     };
     let mut compressor = QualityCompressor::new(config.clone());
     let compressed = compressor.compress(&refs).unwrap();
-    assert!(compressed.is_empty());
+    assert_eq!(compressed, Vec::<u8>::new());
 
     let lengths = vec![5u32, 5];
     let mut decompressor = QualityCompressor::new(config);
@@ -146,7 +197,7 @@ fn test_quality_compress_decompress_empty() {
 
     let mut decompressor = QualityCompressor::new(config);
     let decompressed = decompressor.decompress(&compressed, &[]).unwrap();
-    assert!(decompressed.is_empty());
+    assert_eq!(decompressed, Vec::<String>::new());
 }
 
 #[test]
@@ -208,15 +259,17 @@ fn test_quality_qvz_quantizes_to_codebook() {
 
 #[test]
 fn test_global_analyzer_respects_requested_block_size() {
-    let sequences: Vec<String> = (0..10).map(|_| "ACGTACGT".to_string()).collect();
+    let reads: Vec<ReadRecord> = (0..10)
+        .map(|i| ReadRecord::new(format!("r{i}"), "ACGTACGT".to_string(), "IIIIIIII".to_string()))
+        .collect();
     let analyzer = GlobalAnalyzer::new(GlobalAnalyzerConfig {
         reads_per_block: 3,
-        enable_reorder: false,
+        reorder: fqc::plan::ReorderMode::Never,
         read_length_class: Some(ReadLengthClass::Short),
         ..Default::default()
     });
 
-    let result = analyzer.analyze(&sequences).unwrap();
+    let result = analyzer.analyze(&reads).unwrap();
 
     assert_eq!(result.num_blocks, 4);
     assert_eq!(result.block_boundaries[0].archive_id_start, 0);
@@ -230,4 +283,25 @@ fn test_minimizers_handle_ambiguous_bases_and_zero_window() {
     let minimizers = extract_minimizers(b"ACGTNNACGT", 3, 2);
     assert!(!minimizers.is_empty());
     assert!(extract_minimizers(b"ACGT", 3, 0).is_empty());
+}
+
+#[test]
+fn test_id_declared_size_is_capped_before_decompression() {
+    fn put_uvarint(mut value: u64, out: &mut Vec<u8>) {
+        while value >= 0x80 {
+            out.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+
+    let mut data = vec![ID_MAGIC_EXACT];
+    put_uvarint(600 * 1024 * 1024, &mut data);
+    data.push(0);
+
+    let err = decompress_ids(&data, 1, "read").unwrap_err();
+    assert!(
+        matches!(err, fqc::error::FqcError::ResourceLimit { .. }),
+        "expected ResourceLimit, got {err:?}"
+    );
 }

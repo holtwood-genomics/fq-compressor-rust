@@ -1,34 +1,48 @@
 // =============================================================================
-// fqc-rust - Decompression Pipeline
+// fqc-rust - Decompression pipeline
 // =============================================================================
-// 3-stage pipeline: Reader (serial) → Decompressor (parallel) → Writer (serial)
-// Supports range extraction and original order output.
+// Single decompression orchestration: Reader (serial) → Decompressor
+// (parallel) → Writer (serial). Supports range extraction, header-only output,
+// original-order restore, skip-corrupted placeholders and split R1/R2 output.
 // =============================================================================
 
+use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
-use crate::algo::block_compressor::{BlockCompressor, BlockCompressorConfig, DecompressedBlockData};
+use crate::algo::block_compressor::{BlockCompressor, BlockCompressorConfig};
 use crate::archive::format::{get_id_mode, get_quality_mode, get_read_length_class};
 use crate::archive::reader::FqcReader;
-use crate::archive::traits::BlockData;
+use crate::block::EncodedBlock;
 use crate::error::{FqcError, Result};
-use crate::fastq::parser::write_record;
-use crate::io::async_io::AsyncWriter;
-use crate::io::OutputTransaction;
-use crate::memory_budget::DecodeBudget;
+use crate::memory::DecodeBudget;
+use crate::plan::decompress::DecompressSettings;
 
-use super::{PipelineControl, PipelineStats, DEFAULT_MAX_IN_FLIGHT_BLOCKS};
+use super::decompression_writer::{spawn_writer_thread, BlockResult, WriterPlan};
+use super::DEFAULT_MAX_IN_FLIGHT_BLOCKS;
+
+/// 多条线程同时失败时优先返回真实根因，而不是 channel 关闭的次生错误。
+fn prefer_thread_error(errors: Vec<FqcError>) -> FqcError {
+    let mut fallback = None;
+    for error in errors {
+        if !format!("{error}").contains("channel closed") {
+            return error;
+        }
+        fallback.get_or_insert(error);
+    }
+    fallback.unwrap_or_else(|| FqcError::Decompression("Decompression pipeline failed without an error".to_string()))
+}
+use crate::stats::OperationStats;
 
 // =============================================================================
-// DecompressionPipelineConfig
+// DecompressionConfig
 // =============================================================================
 
 #[derive(Clone)]
-pub struct DecompressionPipelineConfig {
+pub struct DecompressionConfig {
     pub num_threads: usize,
     pub max_in_flight_blocks: usize,
     pub range_start: u64,
@@ -38,13 +52,13 @@ pub struct DecompressionPipelineConfig {
     pub skip_corrupted: bool,
     pub corrupted_placeholder: Option<String>,
     pub force_overwrite: bool,
-    /// Split paired-end output into R1/R2 files (sequential path only).
+    /// Split paired-end output into R1/R2 files.
     pub split_pe: bool,
     /// Memory limit in MB (`0` = automatic, still finite).
     pub memory_limit_mb: usize,
 }
 
-impl Default for DecompressionPipelineConfig {
+impl Default for DecompressionConfig {
     fn default() -> Self {
         Self {
             num_threads: 0,
@@ -62,16 +76,27 @@ impl Default for DecompressionPipelineConfig {
     }
 }
 
-impl DecompressionPipelineConfig {
-    pub fn effective_threads(&self) -> usize {
-        if self.num_threads == 0 {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-                .max(1)
-        } else {
-            self.num_threads
+impl From<&DecompressSettings> for DecompressionConfig {
+    fn from(settings: &DecompressSettings) -> Self {
+        Self {
+            num_threads: settings.threads,
+            max_in_flight_blocks: DEFAULT_MAX_IN_FLIGHT_BLOCKS,
+            range_start: settings.range_start,
+            range_end: settings.range_end,
+            original_order: settings.original_order,
+            header_only: settings.header_only,
+            skip_corrupted: settings.skip_corrupted,
+            corrupted_placeholder: settings.corrupted_placeholder.clone(),
+            force_overwrite: settings.force_overwrite,
+            split_pe: settings.split_pe,
+            memory_limit_mb: settings.memory_limit_mb,
         }
+    }
+}
+
+impl DecompressionConfig {
+    pub fn effective_threads(&self) -> usize {
+        crate::plan::codec_thread_limit(self.num_threads, self.memory_limit_mb)
     }
 
     pub fn has_range(&self) -> bool {
@@ -95,46 +120,7 @@ impl DecompressionPipelineConfig {
 
 struct BlockTask {
     block_id: u32,
-    block_data: BlockData,
-}
-
-struct DecompressedResult {
-    block_id: u32,
-    result: std::result::Result<DecompressedBlockData, FqcError>,
-    expected_read_count: u32,
-}
-
-fn placeholder_record(placeholder_seq: &str, block_id: u32, read_idx: usize) -> crate::types::ReadRecord {
-    crate::types::ReadRecord {
-        id: format!("corrupted_block{}_read{}", block_id, read_idx),
-        comment: String::new(),
-        sequence: placeholder_seq.to_string(),
-        quality: "!".repeat(placeholder_seq.len()),
-    }
-}
-
-fn write_output_read(
-    output: &mut dyn std::io::Write,
-    read: &crate::types::ReadRecord,
-    header_only: bool,
-) -> Result<u64> {
-    if header_only {
-        let line = if read.comment.is_empty() {
-            format!("@{}\n", read.id)
-        } else {
-            format!("@{} {}\n", read.id, read.comment)
-        };
-        output.write_all(line.as_bytes()).map_err(FqcError::Io)?;
-        Ok(line.len() as u64)
-    } else {
-        write_record(output, read)?;
-        let comment_bytes = if read.comment.is_empty() {
-            0_u64
-        } else {
-            read.comment.len() as u64 + 1
-        };
-        Ok(read.id.len() as u64 + comment_bytes + read.sequence.len() as u64 + read.quality.len() as u64 + 4)
-    }
+    block_data: EncodedBlock,
 }
 
 struct PreparedRun {
@@ -144,21 +130,8 @@ struct PreparedRun {
     end_block: usize,
     compressor_config: Arc<BlockCompressorConfig>,
     max_inflight: usize,
-    writer_input: WriterThreadInput,
-}
-
-struct WriterThreadInput {
-    output_path: String,
-    force_overwrite: bool,
-    header_only: bool,
-    skip_corrupted: bool,
-    corrupted_placeholder: String,
-    range_start: u64,
-    range_end: u64,
-    has_range: bool,
-    start_block: usize,
-    end_block: usize,
-    reads_before_start_block: u64,
+    num_workers: usize,
+    writer_input: WriterPlan,
 }
 
 // =============================================================================
@@ -166,39 +139,28 @@ struct WriterThreadInput {
 // =============================================================================
 
 pub struct DecompressionPipeline {
-    config: DecompressionPipelineConfig,
-    control: PipelineControl,
-    stats: PipelineStats,
+    config: DecompressionConfig,
+    stats: OperationStats,
 }
 
 impl DecompressionPipeline {
-    pub fn new(config: DecompressionPipelineConfig) -> Self {
+    pub fn new(config: DecompressionConfig) -> Self {
         Self {
             config,
-            control: PipelineControl::new(),
-            stats: PipelineStats::default(),
+            stats: OperationStats::default(),
         }
     }
 
-    pub fn stats(&self) -> &PipelineStats {
+    pub fn stats(&self) -> &OperationStats {
         &self.stats
     }
 
     /// Run decompression pipeline
-    pub fn run(&mut self, input_path: &str, output_path: &str) -> Result<()> {
-        if self.config.split_pe {
-            return Err(FqcError::InvalidArgument(
-                "--split-pe requires the sequential decompression path".to_string(),
-            ));
-        }
-        if self.config.original_order {
-            return Err(FqcError::InvalidArgument(
-                "--original-order requires the sequential decompression path".to_string(),
-            ));
-        }
+    pub fn run(&mut self, input_path: impl AsRef<Path>, output_path: impl AsRef<Path>) -> Result<()> {
+        let input_path = input_path.as_ref();
+        let output_path = output_path.as_ref();
         self.config.validate_range()?;
         let start = Instant::now();
-        let threads = self.config.effective_threads();
 
         let PreparedRun {
             reader,
@@ -207,27 +169,22 @@ impl DecompressionPipeline {
             end_block,
             compressor_config,
             max_inflight,
+            num_workers,
             writer_input,
             ..
         } = self.prepare(input_path, output_path)?;
 
         let (task_tx, task_rx): (Sender<BlockTask>, Receiver<BlockTask>) = bounded(max_inflight);
-        let (result_tx, result_rx): (Sender<DecompressedResult>, Receiver<DecompressedResult>) = bounded(max_inflight);
+        let (result_tx, result_rx): (Sender<BlockResult>, Receiver<BlockResult>) = bounded(max_inflight);
 
-        let control = self.control.clone();
         let skip_corrupted = self.config.skip_corrupted;
         let reader_result_tx = result_tx.clone();
 
         // ---- Reader thread ----
-        let reader_control = control.clone();
         let reader_handle = thread::spawn(move || -> Result<u64> {
             let mut reader = reader;
             let t = Instant::now();
             for block_id in start_block..end_block {
-                if reader_control.is_cancelled() {
-                    break;
-                }
-
                 let expected_read_count = reader
                     .block_index
                     .entries
@@ -244,7 +201,7 @@ impl DecompressionPipeline {
                     Err(e) => {
                         if skip_corrupted {
                             reader_result_tx
-                                .send(DecompressedResult {
+                                .send(BlockResult {
                                     block_id: block_id as u32,
                                     result: Err(e),
                                     expected_read_count,
@@ -260,7 +217,7 @@ impl DecompressionPipeline {
         });
 
         // ---- Decompressor threads ----
-        let num_decomp_threads = threads.max(1);
+        let num_decomp_threads = num_workers.max(1);
         let mut decomp_handles = Vec::new();
         let decode_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
@@ -268,28 +225,21 @@ impl DecompressionPipeline {
             let rx = task_rx.clone();
             let tx = result_tx.clone();
             let cfg = compressor_config.clone();
-            let ctrl = control.clone();
             let decode_ns = Arc::clone(&decode_ns);
 
             let handle = thread::spawn(move || -> Result<()> {
                 let mut compressor = BlockCompressor::new((*cfg).clone());
 
                 for task in rx.iter() {
-                    if ctrl.is_cancelled() {
-                        break;
-                    }
-
-                    let bh = &task.block_data.header;
+                    let bh = &task.block_data.meta;
                     let t = Instant::now();
                     let decomp_result = compressor.decompress_block(&task.block_data);
                     decode_ns.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 
-                    ctrl.add_reads(bh.uncompressed_count as u64);
-
-                    tx.send(DecompressedResult {
+                    tx.send(BlockResult {
                         block_id: task.block_id,
                         result: decomp_result,
-                        expected_read_count: bh.uncompressed_count,
+                        expected_read_count: bh.read_count,
                     })
                     .map_err(|_| FqcError::Decompression("Decompressor: channel closed".to_string()))?;
                 }
@@ -301,41 +251,68 @@ impl DecompressionPipeline {
         drop(result_tx);
 
         // ---- Writer thread ----
-        let writer_handle = self.spawn_writer_thread(writer_input, result_rx, control.clone());
+        let writer_handle = spawn_writer_thread(writer_input, result_rx);
 
         // ---- Wait ----
-        let reader_read_ms = reader_handle
-            .join()
-            .map_err(|_| FqcError::Decompression("Reader thread panicked".to_string()))??;
+        // 先 join 全部线程再决定返回哪个错误：解码/写入失败会让别处的 channel
+        // 关闭并产生 "channel closed" 次生错误，提前返回会把它当成根因。
+        let mut thread_errors: Vec<FqcError> = Vec::new();
+        let reader_read_ms = match reader_handle.join() {
+            Ok(Ok(ms)) => Some(ms),
+            Ok(Err(err)) => {
+                thread_errors.push(err);
+                None
+            }
+            Err(_) => {
+                thread_errors.push(FqcError::Decompression("Reader thread panicked".to_string()));
+                None
+            }
+        };
         for h in decomp_handles {
-            h.join()
-                .map_err(|_| FqcError::Decompression("Decompressor thread panicked".to_string()))??;
+            match h.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => thread_errors.push(err),
+                Err(_) => thread_errors.push(FqcError::Decompression("Decompressor thread panicked".to_string())),
+            }
         }
         let decode_ms = decode_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000;
-        let (reads_written, output_bytes, total_bases, corrupted_blocks, writer_write_ms) = writer_handle
-            .join()
-            .map_err(|_| FqcError::Decompression("Writer thread panicked".to_string()))??;
+        let writer = match writer_handle.join() {
+            Ok(Ok(writer)) => Some(writer),
+            Ok(Err(err)) => {
+                thread_errors.push(err);
+                None
+            }
+            Err(_) => {
+                thread_errors.push(FqcError::Decompression("Writer thread panicked".to_string()));
+                None
+            }
+        };
+        if !thread_errors.is_empty() || reader_read_ms.is_none() || writer.is_none() {
+            return Err(prefer_thread_error(thread_errors));
+        }
+        let reader_read_ms = reader_read_ms.expect("checked above");
+        let writer = writer.expect("checked above");
 
         let elapsed = start.elapsed();
-        self.stats = PipelineStats {
-            total_reads: reads_written,
-            total_bases,
-            total_blocks: (end_block - start_block) as u32,
+        self.stats = OperationStats {
+            total_reads: writer.reads_written,
+            total_bases: writer.total_bases,
+            blocks: (end_block - start_block) as u64,
             input_bytes: file_size,
-            output_bytes,
-            processing_time_ms: elapsed.as_millis() as u64,
+            output_bytes: writer.output_bytes,
+            elapsed_seconds: elapsed.as_secs_f64(),
             reorder_map_written: false,
-            corrupted_blocks,
+            corrupted_blocks: writer.corrupted_blocks,
             parse_ms: reader_read_ms,
             reorder_ms: 0,
             process_ms: decode_ms,
-            write_ms: writer_write_ms,
+            write_ms: writer.write_ms,
         };
 
         log::info!(
             "Decompression complete: {} reads, {} blocks, {:.1} MB/s",
             self.stats.total_reads,
-            self.stats.total_blocks,
+            self.stats.blocks,
             self.stats.throughput_mbps(),
         );
 
@@ -345,18 +322,36 @@ impl DecompressionPipeline {
     /// Prepare the reader, block range, and per-writer inputs ahead of
     /// spawning the threaded pipeline. Kept separate so `run` stays under the
     /// line budget and the reorder/range semantics live in one place.
-    fn prepare(&self, input_path: &str, output_path: &str) -> Result<PreparedRun> {
+    fn prepare(&self, input_path: &Path, output_path: &Path) -> Result<PreparedRun> {
         let budget = DecodeBudget::resolve(self.config.memory_limit_mb);
-        let reader = FqcReader::open_with_budget(input_path, budget)?;
+        let mut reader = FqcReader::open_with_budget(input_path, budget)?;
         let block_count = reader.block_count();
         let file_size = reader.file_size;
+
+        if self.config.original_order {
+            if !reader.has_reorder_map() {
+                return Err(FqcError::Format(
+                    "Original order requested but no reorder map present".to_string(),
+                ));
+            }
+            let avg_length = reader.memory_estimate_read_length() as u64;
+            reader.budget().check_original_order_peak(
+                reader.total_read_count(),
+                reader.max_block_compressed_size(),
+                avg_length,
+            )?;
+            reader.load_reorder_map()?;
+            log::info!("Reorder map loaded");
+        }
 
         let f = reader.global_header.flags;
         let quality_mode = get_quality_mode(f);
         let id_mode = get_id_mode(f);
         let read_length_class = get_read_length_class(f);
 
-        let (start_block, end_block) = if self.config.has_range() {
+        let (start_block, end_block) = if self.config.original_order {
+            (0, block_count)
+        } else if self.config.has_range() {
             self.find_block_range(&reader)
         } else {
             (0, block_count)
@@ -378,15 +373,41 @@ impl DecompressionPipeline {
             read_length_class,
             quality_mode,
             id_mode,
+            // 单块 ReadRecord 骨架不得超过单次分配预算：read_count 来自
+            // 文件，旧路径在预算检查前直接按它分配（--memory-limit 16 下
+            // 500k reads 的构造归档峰值超出约 35 MB）。
+            max_block_decoded_bytes: reader.budget().max_alloc_bytes,
+            max_read_length_bytes: Some(read_length_class.max_read_length() as u32),
             ..Default::default()
         });
 
         let block_hint = reader.max_block_compressed_size();
+        let max_block_reads = reader
+            .block_index
+            .entries
+            .iter()
+            .map(|entry| entry.read_count as usize)
+            .max()
+            .unwrap_or(1_000);
+        let worker_bytes =
+            compressor_config.estimated_worker_bytes(max_block_reads, reader.memory_estimate_read_length()) as u64;
+        let num_workers = reader
+            .budget()
+            .max_workers_for_budget(worker_bytes, reader.budget().worker_budget_bytes())
+            .min(self.config.effective_threads())
+            .min(block_count.max(1))
+            .max(1);
         let budget_batch = reader
             .budget()
             .parallel_batch_size(self.config.effective_threads(), block_hint)?
             .max(1);
         let max_inflight = self.config.max_in_flight_blocks.min(budget_batch).max(1);
+        let total_archive_reads = reader.total_read_count();
+        let forward_map = if self.config.original_order {
+            reader.reorder_forward.clone()
+        } else {
+            None
+        };
 
         Ok(PreparedRun {
             reader,
@@ -395,9 +416,13 @@ impl DecompressionPipeline {
             end_block,
             compressor_config,
             max_inflight,
-            writer_input: WriterThreadInput {
-                output_path: output_path.to_string(),
+            num_workers,
+            writer_input: WriterPlan {
+                output_path: output_path.to_path_buf(),
                 force_overwrite: self.config.force_overwrite,
+                split_pe: self.config.split_pe,
+                archive_flags: f,
+                original_order: self.config.original_order,
                 header_only: self.config.header_only,
                 skip_corrupted: self.config.skip_corrupted,
                 corrupted_placeholder: self
@@ -411,132 +436,9 @@ impl DecompressionPipeline {
                 start_block,
                 end_block,
                 reads_before_start_block,
+                total_archive_reads,
+                forward_map,
             },
-        })
-    }
-
-    /// Writer stage: receives decompressed blocks in archive order, applies
-    /// range filtering, and writes transactionally (or to stdout).
-    fn spawn_writer_thread(
-        &self,
-        input: WriterThreadInput,
-        result_rx: Receiver<DecompressedResult>,
-        control: PipelineControl,
-    ) -> thread::JoinHandle<Result<(u64, u64, u64, u32, u64)>> {
-        let output_path_owned = input.output_path;
-        let force_overwrite = input.force_overwrite;
-        let header_only = input.header_only;
-        let skip_corrupted = input.skip_corrupted;
-        let corrupted_placeholder = input.corrupted_placeholder;
-        let range_start = input.range_start;
-        let range_end = input.range_end;
-        let has_range = input.has_range;
-        let start_block = input.start_block;
-        let end_block = input.end_block;
-        let reads_before_start_block = input.reads_before_start_block;
-
-        thread::spawn(move || -> Result<(u64, u64, u64, u32, u64)> {
-            let t = Instant::now();
-            const ASYNC_WRITE_BUF: usize = 4 * 1024 * 1024; // 4 MB write-behind buffer
-            const ASYNC_WRITE_DEPTH: usize = 4;
-
-            let (mut output, output_tx): (Box<dyn std::io::Write>, Option<OutputTransaction>) =
-                if output_path_owned == "-" {
-                    (Box::new(std::io::BufWriter::new(std::io::stdout())), None)
-                } else {
-                    let mut tx = OutputTransaction::begin(&output_path_owned, force_overwrite)?;
-                    let file = tx.take_file()?;
-                    (
-                        Box::new(AsyncWriter::new(file, ASYNC_WRITE_DEPTH, ASYNC_WRITE_BUF)),
-                        Some(tx),
-                    )
-                };
-
-            let mut pending: std::collections::BTreeMap<u32, DecompressedResult> = std::collections::BTreeMap::new();
-            let mut next_expected: u32 = start_block as u32;
-            let mut total_output_bytes: u64 = 0;
-            let mut total_reads_written: u64 = 0;
-            let mut total_bases: u64 = 0;
-            let mut corrupted_blocks: u32 = 0;
-            let mut global_read_idx: u64 = reads_before_start_block;
-            let end_block_id: u32 = end_block as u32;
-
-            for dr in result_rx.iter() {
-                if control.is_cancelled() {
-                    break;
-                }
-                pending.insert(dr.block_id, dr);
-
-                while let Some(dr) = pending.remove(&next_expected) {
-                    match dr.result {
-                        Ok(decompressed) => {
-                            for read in &decompressed.reads {
-                                global_read_idx += 1;
-                                // Per-read range filtering (1-based)
-                                if has_range {
-                                    if range_start > 0 && global_read_idx < range_start {
-                                        continue;
-                                    }
-                                    if range_end > 0 && global_read_idx > range_end {
-                                        continue;
-                                    }
-                                }
-                                total_output_bytes += write_output_read(output.as_mut(), read, header_only)?;
-                                total_reads_written += 1;
-                                total_bases += read.sequence.len() as u64;
-                            }
-                        }
-                        Err(e) => {
-                            if skip_corrupted {
-                                for read_idx in 0..dr.expected_read_count as usize {
-                                    global_read_idx += 1;
-                                    if has_range {
-                                        if range_start > 0 && global_read_idx < range_start {
-                                            continue;
-                                        }
-                                        if range_end > 0 && global_read_idx > range_end {
-                                            continue;
-                                        }
-                                    }
-                                    let placeholder = placeholder_record(&corrupted_placeholder, dr.block_id, read_idx);
-                                    total_output_bytes +=
-                                        write_output_read(output.as_mut(), &placeholder, header_only)?;
-                                    total_reads_written += 1;
-                                    total_bases += placeholder.sequence.len() as u64;
-                                }
-                                corrupted_blocks += 1;
-                                log::warn!("Block {} corrupted, skipping: {}", dr.block_id, e);
-                            } else {
-                                return Err(e);
-                            }
-                        }
-                    }
-                    next_expected += 1;
-                }
-            }
-
-            // A worker error or cancellation closes the channel early. Never
-            // commit a partial output: the transaction drops the temp file.
-            if !pending.is_empty() || (next_expected < end_block_id && !control.is_cancelled()) {
-                return Err(FqcError::Decompression(format!(
-                    "Decompression incomplete: processed {} of blocks up to {}; output aborted",
-                    next_expected - start_block as u32,
-                    end_block_id
-                )));
-            }
-
-            output.flush().map_err(FqcError::Io)?;
-            drop(output);
-            if let Some(tx) = output_tx {
-                tx.commit()?;
-            }
-            Ok((
-                total_reads_written,
-                total_output_bytes,
-                total_bases,
-                corrupted_blocks,
-                t.elapsed().as_millis() as u64,
-            ))
         })
     }
 

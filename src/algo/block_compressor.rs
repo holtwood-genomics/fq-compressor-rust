@@ -18,7 +18,7 @@ use crate::algo::quality_compressor::{
     ContextOrder, QualityCompressor as ScmQualityCompressor, QualityCompressorConfig,
 };
 use crate::algo::zstd_sequence::ZstdSequenceCompressor;
-use crate::archive::traits::BlockData;
+use crate::block::{BlockMeta, DecodedBlock, EncodedBlock};
 use crate::error::{FqcError, Result};
 use crate::types::*;
 use xxhash_rust::xxh64::Xxh64;
@@ -67,6 +67,22 @@ pub struct BlockCompressorConfig {
     pub zstd_level: i32,
     /// ID prefix for discard mode reconstruction (e.g., "read" → @read1, @read2, ...)
     pub id_prefix: String,
+    /// Upper bound for the decoded bytes of one block:
+    /// `read_count * size_of::<ReadRecord>() + 2 * sum(read lengths)`.
+    /// `u64::MAX` disables the check (compression path). Decompress/verify
+    /// set this from `DecodeBudget::max_alloc_bytes`. Both terms come from
+    /// the block header/aux stream, so without this cap a forged archive can
+    /// drive `vec![ReadRecord; read_count]` and per-read sequence/quality
+    /// allocations past `--memory-limit`.
+    pub max_block_decoded_bytes: u64,
+    /// Hard per-read length ceiling enforced while decoding, in bytes.
+    ///
+    /// Archive-managed decode paths set this from the read-length class in the
+    /// (untrusted) header, so a crafted archive that declares a smaller class
+    /// cannot use it to under-estimate the decode budget. `None` (library /
+    /// test use) keeps the historical behaviour of decoding whatever the block
+    /// declares, as long as `max_block_decoded_bytes` allows it.
+    pub max_read_length_bytes: Option<u32>,
 }
 
 impl Default for BlockCompressorConfig {
@@ -79,6 +95,49 @@ impl Default for BlockCompressorConfig {
             consensus_hamming_threshold: 16,
             zstd_level: 3,
             id_prefix: String::from("read"),
+            max_block_decoded_bytes: u64::MAX,
+            max_read_length_bytes: None,
+        }
+    }
+}
+
+/// Codec parameters that do not depend on the detected read-length class.
+///
+/// The pipeline cannot know the class until it has ingested the whole input,
+/// so its configuration carries these settings and resolves the class once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockCodecSettings {
+    pub quality_mode: QualityMode,
+    pub id_mode: IdMode,
+    pub zstd_level: i32,
+}
+
+impl Default for BlockCodecSettings {
+    fn default() -> Self {
+        Self {
+            quality_mode: QualityMode::Lossless,
+            id_mode: IdMode::Exact,
+            zstd_level: 3,
+        }
+    }
+}
+
+impl BlockCodecSettings {
+    pub fn from_compression_level(quality_mode: QualityMode, id_mode: IdMode, level: CompressionLevel) -> Self {
+        Self {
+            quality_mode,
+            id_mode,
+            zstd_level: BlockCompressorConfig::zstd_level_for_compression_level(level),
+        }
+    }
+
+    pub fn with_read_length_class(self, read_length_class: ReadLengthClass) -> BlockCompressorConfig {
+        BlockCompressorConfig {
+            read_length_class,
+            quality_mode: self.quality_mode,
+            id_mode: self.id_mode,
+            zstd_level: self.zstd_level,
+            ..Default::default()
         }
     }
 }
@@ -119,41 +178,19 @@ impl BlockCompressorConfig {
     pub fn use_short_read_abc(&self, read_count: usize) -> bool {
         self.read_length_class == ReadLengthClass::Short && read_count <= SHORT_READ_ABC_MAX_READS
     }
-}
 
-// =============================================================================
-// CompressedBlockData
-// =============================================================================
-
-#[derive(Debug, Default, Clone)]
-pub struct CompressedBlockData {
-    pub block_id: BlockId,
-    pub read_count: u32,
-    pub uniform_read_length: u32,
-    pub block_checksum: u64,
-    pub codec_ids: u8,
-    pub codec_seq: u8,
-    pub codec_qual: u8,
-    pub codec_aux: u8,
-    pub id_stream: Vec<u8>,
-    pub seq_stream: Vec<u8>,
-    pub qual_stream: Vec<u8>,
-    pub aux_stream: Vec<u8>,
-}
-
-impl CompressedBlockData {
-    pub fn total_compressed_size(&self) -> usize {
-        self.id_stream.len() + self.seq_stream.len() + self.qual_stream.len() + self.aux_stream.len()
+    /// Conservative peak estimate for one parallel codec worker.
+    ///
+    /// The quality context model dominates order-2 short-read blocks; the
+    /// record and Zstd buffers are included so memory-limited runs reduce
+    /// worker count instead of silently exceeding `--memory-limit`.
+    pub fn estimated_worker_bytes(&self, reads: usize, avg_length: usize) -> usize {
+        let model = self.to_quality_config().estimated_model_bytes();
+        usize::try_from(crate::plan::block_plan::estimated_worker_bytes(
+            model, reads, avg_length,
+        ))
+        .unwrap_or(usize::MAX)
     }
-}
-
-// =============================================================================
-// DecompressedBlockData
-// =============================================================================
-
-#[derive(Debug, Default)]
-pub struct DecompressedBlockData {
-    pub reads: Vec<ReadRecord>,
 }
 
 // =============================================================================
@@ -209,10 +246,13 @@ impl BlockCompressor {
         }
     }
 
-    pub fn compress(&mut self, reads: &[ReadRecord], block_id: BlockId) -> Result<CompressedBlockData> {
-        let mut result = CompressedBlockData {
-            block_id,
-            read_count: reads.len() as u32,
+    pub fn compress(&mut self, reads: &[ReadRecord], block_id: BlockId) -> Result<EncodedBlock> {
+        let mut result = EncodedBlock {
+            meta: BlockMeta {
+                block_id,
+                read_count: reads.len() as u32,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -228,56 +268,56 @@ impl BlockCompressor {
             // Use ABC for small blocks of short reads
             let abc = AbcCompressor::new(self.config.to_abc_config());
             result.seq_stream = abc.compress(reads)?.data;
-            result.codec_seq = encode_codec(CodecFamily::AbcV1, 1);
+            result.meta.codec_seq = encode_codec(CodecFamily::AbcV1, 1);
         } else {
             // Use Zstd for large blocks (even if read_length_class is Short)
             // or for medium/long reads
             let zstd = ZstdSequenceCompressor::new(self.config.zstd_level);
             result.seq_stream = zstd.compress(reads)?;
-            result.codec_seq = zstd.codec_id();
+            result.meta.codec_seq = zstd.codec_id();
         }
 
         // Compress quality
         result.qual_stream = self.quality.compress(reads)?;
-        result.codec_qual = self.quality.codec_id();
+        result.meta.codec_qual = self.quality.codec_id();
 
         // Compress IDs
         result.id_stream = self.id.compress(reads)?;
-        result.codec_ids = self.id.codec_id();
+        result.meta.codec_ids = self.id.codec_id();
 
         // Compress aux (lengths)
         let (aux_data, uniform_len) = self.aux.compress(reads)?;
         result.aux_stream = aux_data;
-        result.uniform_read_length = uniform_len;
-        result.codec_aux = self.aux.codec_id();
+        result.meta.uniform_read_length = uniform_len;
+        result.meta.codec_aux = self.aux.codec_id();
 
         // Preserve the historical v2 logical checksum only when every field
         // round-trips exactly. Lossy/discard blocks use the archive-wide
         // compressed-stream checksum and leave this optional field at zero.
         if self.config.quality_mode == QualityMode::Lossless && self.config.id_mode != IdMode::Discard {
-            result.block_checksum = compute_block_checksum(reads);
+            result.meta.block_checksum = compute_block_checksum(reads);
         }
 
         Ok(result)
     }
 
-    /// Decompress a block from raw `BlockData`.
-    pub fn decompress_block(&mut self, block: &BlockData) -> Result<DecompressedBlockData> {
-        let bh = &block.header;
+    /// Decompress a neutral encoded block.
+    pub fn decompress_block(&mut self, block: &EncodedBlock) -> Result<DecodedBlock> {
+        let meta = &block.meta;
         let decompressed = self.decompress_raw(
-            bh.block_id,
-            bh.uncompressed_count,
-            bh.uniform_read_length,
-            bh.codec_ids,
-            bh.codec_seq,
-            bh.codec_qual,
-            bh.codec_aux,
-            &block.ids_data,
-            &block.seq_data,
-            &block.qual_data,
-            &block.aux_data,
+            meta.block_id,
+            meta.read_count,
+            meta.uniform_read_length,
+            meta.codec_ids,
+            meta.codec_seq,
+            meta.codec_qual,
+            meta.codec_aux,
+            &block.id_stream,
+            &block.seq_stream,
+            &block.qual_stream,
+            &block.aux_stream,
         )?;
-        self.verify_block_checksum(bh.block_xxhash64, &decompressed.reads)?;
+        self.verify_block_checksum(meta.block_checksum, &decompressed.reads)?;
         Ok(decompressed)
     }
 
@@ -296,8 +336,20 @@ impl BlockCompressor {
         seq_stream: &[u8],
         qual_stream: &[u8],
         aux_stream: &[u8],
-    ) -> Result<DecompressedBlockData> {
-        let mut result = DecompressedBlockData {
+    ) -> Result<DecodedBlock> {
+        // read_count comes from the block header. It is cross-checked against
+        // the block index, but not against the memory budget, so a forged
+        // archive can drive `vec![ReadRecord; read_count]` (96 B/read) before
+        // any per-block check. Reject oversized skeletons first.
+        let skeleton_bytes = u64::from(read_count).saturating_mul(std::mem::size_of::<ReadRecord>() as u64);
+        if skeleton_bytes > self.config.max_block_decoded_bytes {
+            return Err(FqcError::ResourceLimit {
+                location: format!("block {block_id} read_record_skeleton"),
+                declared: skeleton_bytes,
+                allowed: self.config.max_block_decoded_bytes,
+            });
+        }
+        let mut result = DecodedBlock {
             reads: vec![ReadRecord::default(); read_count as usize],
         };
 
@@ -378,6 +430,32 @@ impl BlockCompressor {
                 "block {block_id} aux stream decoded {} lengths for {read_count} reads",
                 lengths.len()
             )));
+        }
+
+        // 单条读长的硬上限：归档的读长分类来自头部（不可信），而解压预算
+        // （worker 数、--original-order 峰值）按分类上限推导。这里拒掉超过
+        // 分类上限的读长，保证那些估算永远是上界而不是猜测。
+        if let Some(max_read_len) = self.config.max_read_length_bytes {
+            if let Some(&bad) = lengths.iter().find(|&&l| l > max_read_len) {
+                return Err(FqcError::Format(format!(
+                    "block {block_id} read length {bad} exceeds the {} class limit {max_read_len}",
+                    self.config.read_length_class.as_str()
+                )));
+            }
+        }
+
+        // Lengths are untrusted (header uniform value or aux stream). Each
+        // read allocates about `len` bytes for sequence and `len` for
+        // quality, so bound their sum by the same per-block decode budget
+        // before any decoder sees them.
+        let total_bases: u64 = lengths.iter().map(|&l| u64::from(l)).fold(0u64, u64::saturating_add);
+        let decoded_bytes = skeleton_bytes.saturating_add(total_bases.saturating_mul(2));
+        if decoded_bytes > self.config.max_block_decoded_bytes {
+            return Err(FqcError::ResourceLimit {
+                location: format!("block {block_id} decoded_bytes"),
+                declared: decoded_bytes,
+                allowed: self.config.max_block_decoded_bytes,
+            });
         }
 
         let sequences = match seq_family {
@@ -483,11 +561,25 @@ impl BlockCompressor {
         uniform_read_length: u32,
         lengths: &[u32],
     ) -> Result<Vec<String>> {
+        // Raw 质量流表示 Discard 模式：解压只产出占位质量串，不需要
+        // order-2 上下文模型（约 13 MiB）。避免为每个 discard block 白建一次模型。
+        if family == CodecFamily::Raw {
+            if !data.is_empty() {
+                return Err(FqcError::Format(
+                    "Discarded quality stream must not contain payload bytes".to_string(),
+                ));
+            }
+            let length_vec: Vec<u32> = if uniform_read_length > 0 {
+                vec![uniform_read_length; read_count as usize]
+            } else {
+                lengths.to_vec()
+            };
+            return Ok(length_vec.iter().map(|&len| "!".repeat(len as usize)).collect());
+        }
+
         let mut qcfg = self.config.to_quality_config();
         match family {
-            CodecFamily::Raw => {
-                qcfg.quality_mode = QualityMode::Discard;
-            }
+            CodecFamily::Raw => unreachable!("Raw quality stream handled above"),
             CodecFamily::ScmV1 => {
                 qcfg.context_order = ContextOrder::Order2;
                 if qcfg.quality_mode == QualityMode::Discard {
@@ -581,92 +673,4 @@ pub fn compute_block_checksum(reads: &[ReadRecord]) -> u64 {
         hasher.update(&(r.sequence.len() as u32).to_le_bytes());
     }
     hasher.digest()
-}
-
-// =============================================================================
-// Varint helpers for reorder map (used by archive::writer/archive::reader)
-// =============================================================================
-
-pub fn encode_varint(mut value: u64) -> Vec<u8> {
-    let mut buf = Vec::new();
-    loop {
-        let byte = (value & 0x7F) as u8;
-        value >>= 7;
-        if value != 0 {
-            buf.push(byte | 0x80);
-        } else {
-            buf.push(byte);
-            break;
-        }
-    }
-    buf
-}
-
-pub fn delta_encode_ids(ids: &[u64]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let mut prev = 0i64;
-    for &id in ids {
-        let delta = id as i64 - prev;
-        prev = id as i64;
-        // Perform the zig-zag transform in unsigned space. Shifting a
-        // negative i64 directly can overflow in debug builds; the cast keeps
-        // the two's-complement bit pattern while the u64 shift is defined.
-        let zigzag = ((delta as u64) << 1) ^ ((delta >> 63) as u64);
-        buf.extend_from_slice(&encode_varint(zigzag));
-    }
-    buf
-}
-
-pub fn delta_decode_ids(data: &[u8], count: u64) -> Result<Vec<u64>> {
-    let expected = usize::try_from(count)
-        .map_err(|_| FqcError::Format("delta_decode_ids count exceeds platform limits".to_string()))?;
-    let mut ids = Vec::with_capacity(expected);
-    let mut i = 0usize;
-    let mut prev = 0i64;
-
-    for id_index in 0..expected {
-        let mut zigzag = 0u64;
-        let mut terminated = false;
-        for byte_index in 0..10 {
-            let byte = *data
-                .get(i)
-                .ok_or_else(|| FqcError::Format(format!("delta_decode_ids: truncated varint at id {id_index}")))?;
-            i += 1;
-            let payload = u64::from(byte & 0x7F);
-            if byte_index == 9 && payload > 1 {
-                return Err(FqcError::Format(format!(
-                    "delta_decode_ids: varint overflows u64 at id {id_index}"
-                )));
-            }
-            zigzag |= payload << (byte_index * 7);
-            if (byte & 0x80) == 0 {
-                terminated = true;
-                break;
-            }
-        }
-        if !terminated {
-            return Err(FqcError::Format(format!(
-                "delta_decode_ids: unterminated varint at id {id_index}"
-            )));
-        }
-        let delta = ((zigzag >> 1) as i64) ^ (-((zigzag & 1) as i64));
-        prev = prev
-            .checked_add(delta)
-            .ok_or_else(|| FqcError::Format(format!("delta_decode_ids: delta overflows at id {id_index}")))?;
-        if prev < 0 {
-            return Err(FqcError::Format(format!(
-                "delta_decode_ids: decoded negative id at position {id_index}"
-            )));
-        }
-        ids.push(prev as u64);
-    }
-
-    if i != data.len() {
-        return Err(FqcError::Format(format!(
-            "delta_decode_ids: trailing bytes after {} ids",
-            count,
-        )));
-    }
-
-    Ok(ids)
 }

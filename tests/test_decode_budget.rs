@@ -1,13 +1,16 @@
 //! Decode / verify resource budget tests (FQCR-LIMIT-001).
 
-use fqc::archive::format::{BLOCK_INDEX_HEADER_SIZE, INDEX_ENTRY_SIZE};
+use fqc::algo::block_compressor::{BlockCompressor, BlockCompressorConfig};
+use fqc::archive::format::{BlockHeader, BLOCK_INDEX_HEADER_SIZE, INDEX_ENTRY_SIZE};
 use fqc::archive::reader::FqcReader;
 use fqc::commands::compress::{CompressCommand, CompressOptions};
 use fqc::commands::decompress::{DecompressCommand, DecompressOptions};
 use fqc::commands::verify::{VerifyCommand, VerifyOptions};
 use fqc::error::FqcError;
-use fqc::memory_budget::{zstd_decompress_bounded, DecodeBudget, HARD_MAX_INDEX_ENTRIES, MIN_DECODE_MEMORY_MB};
+use fqc::memory::{zstd_decompress_bounded, DecodeBudget, HARD_MAX_INDEX_ENTRIES, MIN_DECODE_MEMORY_MB};
+use fqc::types::{encode_codec, CodecFamily, IdMode, QualityMode, ReadLengthClass};
 use std::fs;
+use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
 
 fn write_tiny_fastq(path: &PathBuf, n_reads: usize) {
@@ -23,6 +26,67 @@ fn write_tiny_fastq(path: &PathBuf, n_reads: usize) {
     fs::write(path, out).unwrap();
 }
 
+fn write_variable_fastq(path: &PathBuf, n_reads: usize) {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for i in 0..n_reads {
+        let length: usize = if i % 2 == 0 { 50 } else { 51 };
+        let seq = "ACGT".repeat(length.div_ceil(4));
+        let qual = "I".repeat(length);
+        write!(out, "@r{i}\n{}\n+\n{}\n", &seq[..length], qual).unwrap();
+    }
+    fs::write(path, out).unwrap();
+}
+
+fn write_two_block_lengths_fastq(path: &PathBuf, n_each: usize, first_len: usize, second_len: usize) {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for (start, length, tag) in [(0, first_len, "a"), (n_each, second_len, "b")] {
+        let seq = "ACGT".repeat(length.div_ceil(4));
+        let qual = "I".repeat(length);
+        for i in start..start + n_each {
+            write!(out, "@{tag}{i}\n{}\n+\n{}\n", &seq[..length], qual).unwrap();
+        }
+    }
+    fs::write(path, out).unwrap();
+}
+
+fn compress_two_block_lengths(dir: &std::path::Path) -> PathBuf {
+    let input = dir.join("two-block-lengths.fastq");
+    let archive = dir.join("two-block-lengths.fqc");
+    write_two_block_lengths_fastq(&input, 100, 50, 51);
+    let code = CompressCommand::new(CompressOptions {
+        input_path: input.to_string_lossy().into_owned(),
+        output_path: archive.to_string_lossy().into_owned(),
+        force_overwrite: true,
+        reorder: fqc::plan::ReorderMode::Never,
+        block_size: 100,
+        threads: 1,
+        show_progress: false,
+        ..Default::default()
+    })
+    .execute();
+    assert_eq!(code, 0, "compress failed");
+    archive
+}
+
+fn compress_variable(dir: &std::path::Path, n_reads: usize) -> (PathBuf, PathBuf) {
+    let input = dir.join("variable.fastq");
+    let archive = dir.join("variable.fqc");
+    write_variable_fastq(&input, n_reads);
+    let code = CompressCommand::new(CompressOptions {
+        input_path: input.to_string_lossy().into_owned(),
+        output_path: archive.to_string_lossy().into_owned(),
+        force_overwrite: true,
+        reorder: fqc::plan::ReorderMode::Always,
+        show_progress: false,
+        ..Default::default()
+    })
+    .execute();
+    assert_eq!(code, 0, "compress failed");
+    (input, archive)
+}
+
 fn compress_tiny(dir: &std::path::Path, n_reads: usize, reorder: bool) -> (PathBuf, PathBuf) {
     let input = dir.join("in.fastq");
     let archive = dir.join("out.fqc");
@@ -31,7 +95,11 @@ fn compress_tiny(dir: &std::path::Path, n_reads: usize, reorder: bool) -> (PathB
         input_path: input.to_string_lossy().into_owned(),
         output_path: archive.to_string_lossy().into_owned(),
         force_overwrite: true,
-        enable_reorder: reorder,
+        reorder: if reorder {
+            fqc::plan::ReorderMode::Always
+        } else {
+            fqc::plan::ReorderMode::Never
+        },
         show_progress: false,
         ..Default::default()
     })
@@ -47,7 +115,7 @@ fn assert_resource_limit(err: FqcError) {
             declared,
             allowed,
         } => {
-            assert!(!location.is_empty());
+            assert_ne!(location, "");
             assert!(declared > allowed || allowed == 0);
         }
         other => panic!("expected ResourceLimit, got {other}"),
@@ -63,7 +131,7 @@ fn tiny_archive_opens_and_verifies_under_min_budget() {
     FqcReader::open_with_budget(archive.to_str().unwrap(), budget).unwrap();
 
     let code = VerifyCommand::new(VerifyOptions {
-        input_path: archive.to_string_lossy().into_owned(),
+        input_path: archive.clone(),
         memory_limit_mb: MIN_DECODE_MEMORY_MB,
         ..Default::default()
     })
@@ -155,10 +223,61 @@ fn zstd_bounded_rejects_expansion_past_ceiling() {
 }
 
 #[test]
+fn zstd_bounded_does_not_preallocate_untrusted_ceiling() {
+    let payload = vec![b'A'; 1024];
+    let compressed = zstd::bulk::compress(&payload, 3).unwrap();
+    // The ceiling is attacker-derived (read lengths) and may be astronomically
+    // large. A preallocating decoder (`zstd::bulk::decompress`) would reserve it
+    // up front and abort; the streaming decoder must grow with actual output.
+    let out = zstd_decompress_bounded(&compressed, usize::MAX / 2, "zstd-huge-ceiling").unwrap();
+    assert_eq!(out, payload);
+}
+
+#[test]
+fn mixed_uniform_blocks_fall_back_to_class_upper_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = compress_two_block_lengths(dir.path());
+
+    let reader = FqcReader::open(archive.to_str().unwrap()).unwrap();
+    assert_eq!(reader.block_count(), 2);
+
+    let mut file = fs::File::open(&archive).unwrap();
+    for (idx, expected) in [50u32, 51].into_iter().enumerate() {
+        file.seek(SeekFrom::Start(reader.block_index.entries[idx].offset))
+            .unwrap();
+        let header = BlockHeader::read(&mut file).unwrap();
+        assert_eq!(
+            header.uniform_read_length, expected,
+            "block {idx} should be internally uniform"
+        );
+    }
+
+    assert_eq!(reader.uniform_read_length(), None);
+    assert_eq!(
+        reader.memory_estimate_read_length(),
+        fqc::types::ReadLengthClass::Short.memory_estimate_read_length()
+    );
+}
+
+#[test]
+fn variable_archive_uses_class_upper_bound_for_estimate() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_input, archive) = compress_variable(dir.path(), 4);
+
+    let reader = FqcReader::open(archive.to_str().unwrap()).unwrap();
+    assert_eq!(reader.uniform_read_length(), None);
+    assert_eq!(
+        reader.memory_estimate_read_length(),
+        fqc::types::ReadLengthClass::Short.memory_estimate_read_length()
+    );
+}
+
+#[test]
 fn original_order_peak_rejected_before_output() {
     let dir = tempfile::tempdir().unwrap();
-    // Enough reads that peak estimate with avg_bases_hint=256 exceeds 16 MB.
-    let (_input, archive) = compress_tiny(dir.path(), 40_000, true);
+    // Non-uniform blocks have no exact header hint, so the Short-class
+    // fallback (511 bp) must make 15k reads exceed the 16 MB peak.
+    let (_input, archive) = compress_variable(dir.path(), 15_000);
 
     let out = dir.path().join("restored.fastq");
     assert!(!out.exists());
@@ -189,6 +308,20 @@ fn automatic_budget_is_finite() {
 }
 
 #[test]
+fn worker_budget_keeps_headroom_for_non_worker_memory() {
+    let budget = DecodeBudget::resolve(128);
+    let reserved = budget.worker_budget_bytes();
+    assert_eq!(reserved, budget.limit_bytes / 3 * 2);
+    assert!(reserved < budget.limit_bytes);
+
+    let worker_bytes = 48 * 1024 * 1024;
+    assert!(
+        budget.max_workers_for_budget(worker_bytes, reserved) < budget.max_workers_for(worker_bytes),
+        "reserved worker budget must be stricter than the raw operation budget"
+    );
+}
+
+#[test]
 fn parallel_batch_never_zero_and_rejects_oversized_block() {
     let budget = DecodeBudget::resolve(MIN_DECODE_MEMORY_MB);
     let n = budget.parallel_batch_size(4, 64 * 1024).unwrap();
@@ -197,4 +330,149 @@ fn parallel_batch_never_zero_and_rejects_oversized_block() {
     let huge = budget.limit_bytes; // compressed hint → peak = *3 > limit
     let err = budget.parallel_batch_size(4, huge).unwrap_err();
     assert_resource_limit(err);
+}
+
+#[test]
+fn forged_read_count_rejected_before_record_skeleton_alloc() {
+    let cfg = BlockCompressorConfig {
+        read_length_class: ReadLengthClass::Short,
+        quality_mode: QualityMode::Lossless,
+        id_mode: IdMode::Exact,
+        max_block_decoded_bytes: 4096,
+        ..Default::default()
+    };
+    let mut bc = BlockCompressor::new(cfg);
+
+    // 100_000 * size_of::<ReadRecord>()(96 B) = 9.6 MB > 4 KiB cap.
+    // The guard must fire before `vec![ReadRecord; read_count]`.
+    let err = bc
+        .decompress_raw(0, 100_000, 0, 0, 0, 0, 0, &[], &[], &[], &[])
+        .unwrap_err();
+    assert_resource_limit(err);
+}
+
+#[test]
+fn decompress_rejects_block_whose_record_skeleton_exceeds_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("many.fastq");
+    let archive = dir.path().join("many.fqc");
+    // 90_000 reads × 96 B = 8.24 MB > max_alloc_bytes(16 MiB budget)=8 MiB.
+    write_tiny_fastq(&input, 90_000);
+    let code = CompressCommand::new(CompressOptions {
+        input_path: input.to_string_lossy().into_owned(),
+        output_path: archive.to_string_lossy().into_owned(),
+        force_overwrite: true,
+        reorder: fqc::plan::ReorderMode::Never,
+        block_size: 200_000,
+        threads: 1,
+        show_progress: false,
+        ..Default::default()
+    })
+    .execute();
+    assert_eq!(code, 0, "compress failed");
+
+    let out = dir.path().join("out.fastq");
+    let code = DecompressCommand::new(DecompressOptions {
+        input_path: archive.to_string_lossy().into_owned(),
+        output_path: out.to_string_lossy().into_owned(),
+        force_overwrite: true,
+        memory_limit_mb: MIN_DECODE_MEMORY_MB,
+        show_progress: false,
+        ..Default::default()
+    })
+    .execute();
+    assert_ne!(
+        code, 0,
+        "a block whose ReadRecord skeleton exceeds max_alloc_bytes must be rejected"
+    );
+}
+
+#[test]
+fn forged_uniform_length_rejected_before_decoders() {
+    let cfg = BlockCompressorConfig {
+        id_mode: IdMode::Discard,
+        quality_mode: QualityMode::Discard,
+        max_block_decoded_bytes: 4096,
+        ..Default::default()
+    };
+    let mut bc = BlockCompressor::new(cfg);
+
+    // 1 read whose declared length is 0xFFFFFFFF: skeleton is only 96 B, but
+    // sequence + quality would allocate ~8 GiB. The aggregate decoded-bytes
+    // check must fire before the sequence/quality decoders run.
+    let err = bc
+        .decompress_raw(
+            0,
+            1,
+            u32::MAX,
+            encode_codec(CodecFamily::Raw, 0),
+            encode_codec(CodecFamily::ZstdPlain, 0),
+            encode_codec(CodecFamily::Raw, 0),
+            encode_codec(CodecFamily::DeltaVarint, 0),
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap_err();
+    assert_resource_limit(err);
+}
+
+#[test]
+fn forged_short_class_with_long_reads_is_rejected() {
+    // 归档的读长分类只是头部的一个字节（不可信）。解压预算（worker 数、
+    // --original-order 峰值）按分类上限推导，所以把 Medium 归档的分类位改成
+    // Short 后，块头声明的 2000 bp 读长必须被拒绝——否则分类上限会变成
+    // 一个小得多的低估。
+    use fqc::archive::format::{flags, MAGIC_HEADER_SIZE};
+    use std::io::{Read, Write};
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("long.fastq");
+    let archive = dir.path().join("long.fqc");
+    {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for i in 0..40 {
+            let seq = "ACGT".repeat(500); // 2000 bp → Medium class
+            let qual = "I".repeat(2000);
+            write!(out, "@r{i}\n{seq}\n+\n{qual}\n").unwrap();
+        }
+        fs::write(&input, out).unwrap();
+    }
+    let code = CompressCommand::new(CompressOptions {
+        input_path: input.to_string_lossy().into_owned(),
+        output_path: archive.to_string_lossy().into_owned(),
+        force_overwrite: true,
+        reorder: fqc::plan::ReorderMode::Never,
+        show_progress: false,
+        ..Default::default()
+    })
+    .execute();
+    assert_eq!(code, 0, "compress failed");
+
+    // 打开正常归档应当成功：块头声明了统一 2000 bp，估算直接用它。
+    let reader = FqcReader::open(&archive).unwrap();
+    assert_eq!(reader.memory_estimate_read_length(), 2000);
+    assert!(2000 <= ReadLengthClass::Medium.max_read_length());
+    drop(reader);
+
+    // 只改分类位，别的一律不动。
+    let mut bytes = Vec::new();
+    fs::File::open(&archive).unwrap().read_to_end(&mut bytes).unwrap();
+    // GlobalHeader = u32 header_size 之后才是 u64 flags。
+    let flags_offset = MAGIC_HEADER_SIZE + std::mem::size_of::<u32>();
+    let mut raw = u64::from_le_bytes(bytes[flags_offset..flags_offset + 8].try_into().unwrap());
+    raw = (raw & !flags::READ_LENGTH_CLASS_MASK) | ((ReadLengthClass::Short as u64) << flags::READ_LENGTH_CLASS_SHIFT);
+    bytes[flags_offset..flags_offset + 8].copy_from_slice(&raw.to_le_bytes());
+    fs::File::create(&archive).unwrap().write_all(&bytes).unwrap();
+
+    let err = match FqcReader::open(&archive) {
+        Ok(_) => panic!("forged Short class with 2000 bp reads must be rejected"),
+        Err(err) => err,
+    };
+    match err {
+        FqcError::Format(msg) => assert!(msg.contains("class limit"), "unexpected format error: {msg}"),
+        other => panic!("expected Format error, got {other}"),
+    }
 }

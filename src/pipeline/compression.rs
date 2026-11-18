@@ -1,30 +1,25 @@
 // =============================================================================
 // fqc-rust - Compression Pipeline
 // =============================================================================
-// 3-stage pipeline: Reader (serial) → Compressor (parallel) → Writer (serial)
-// Uses bounded channels for backpressure control.
-//
 // All topologies (single / paired / interleaved) share one convergence core:
-// `analyze_and_reorder` owns the global-analysis + reorder-map construction,
-// and `write_blocks_parallel` owns the threaded compress-and-write stages.
+// `analyze_and_reorder` owns global analysis + reorder-map construction, and
+// `write_blocks_parallel` delegates the bounded compress/write stage to the
+// shared `block_pipeline` module.
 // =============================================================================
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::thread;
+use std::path::Path;
 use std::time::Instant;
 
-use crossbeam_channel::{bounded, Receiver, Sender};
-
-use crate::algo::block_compressor::{BlockCompressor, BlockCompressorConfig, CompressedBlockData};
+use crate::algo::block_compressor::{BlockCodecSettings, BlockCompressorConfig};
 use crate::algo::global_analyzer::{GlobalAnalyzer, GlobalAnalyzerConfig};
-use crate::archive::format::{build_flags, GlobalHeader};
+use crate::archive::format::build_flags;
 use crate::error::{FqcError, Result};
-use crate::fastq::parser::{open_fastq, open_fastq_interleaved, open_fastq_paired, open_fastq_stdin};
-use crate::io::begin_fqc_writer;
+use crate::plan::{plan_compression_layout, CompressionPlan, CompressionPlanInput, ReorderMode};
 use crate::types::*;
 
-use super::{PipelineControl, PipelineStats, ReadChunk, DEFAULT_MAX_IN_FLIGHT_BLOCKS};
+use super::block_pipeline::{self, BlockPipelineConfig};
+use super::DEFAULT_MAX_IN_FLIGHT_BLOCKS;
+use crate::stats::OperationStats;
 
 // =============================================================================
 // CompressionPipelineConfig
@@ -36,16 +31,21 @@ pub struct CompressionPipelineConfig {
     pub num_threads: usize,
     pub max_in_flight_blocks: usize,
     pub block_size: usize,
-    pub read_length_class: ReadLengthClass,
-    pub quality_mode: QualityMode,
-    pub id_mode: IdMode,
-    pub compression_level: CompressionLevel,
-    pub enable_reorder: bool,
+    /// Codec choices that do not depend on the detected read-length class.
+    pub codec: BlockCodecSettings,
+    /// Explicit class override; `None` classifies the ingested reads.
+    pub requested_read_length_class: Option<ReadLengthClass>,
+    /// Scan every read for classification instead of evenly spaced samples.
+    pub scan_all_lengths: bool,
+    pub reorder: ReorderMode,
     pub save_reorder_map: bool,
-    pub streaming_mode: bool,
     pub pe_layout: PeLayout,
+    pub max_block_bases: usize,
     pub force_overwrite: bool,
     pub memory_limit_mb: usize,
+    /// `--pipeline` rejects sub-100 read blocks; archive keeps the historical
+    /// smaller-block allowance for tests and direct library use.
+    pub enforce_min_block_size: bool,
 }
 
 impl Default for CompressionPipelineConfig {
@@ -54,68 +54,56 @@ impl Default for CompressionPipelineConfig {
             num_threads: 0,
             max_in_flight_blocks: DEFAULT_MAX_IN_FLIGHT_BLOCKS,
             block_size: 0,
-            read_length_class: ReadLengthClass::Short,
-            quality_mode: QualityMode::Lossless,
-            id_mode: IdMode::Exact,
-            compression_level: DEFAULT_COMPRESSION_LEVEL,
-            enable_reorder: true,
+            codec: BlockCodecSettings::default(),
+            requested_read_length_class: None,
+            scan_all_lengths: false,
+            reorder: ReorderMode::Auto,
             save_reorder_map: true,
-            streaming_mode: false,
             pe_layout: PeLayout::Interleaved,
+            max_block_bases: 0,
             force_overwrite: false,
             memory_limit_mb: 0,
+            enforce_min_block_size: true,
         }
     }
 }
 
 impl CompressionPipelineConfig {
-    pub fn effective_threads(&self) -> usize {
-        if self.num_threads == 0 {
-            num_cpus().max(1)
-        } else {
-            self.num_threads
-        }
-    }
-
-    pub fn effective_block_size(&self) -> usize {
-        if self.block_size > 0 {
-            self.block_size
-        } else {
-            recommended_block_size(self.read_length_class)
-        }
+    fn block_plan(&self, total_reads: usize, total_bases: u64, read_length_class: ReadLengthClass) -> CompressionPlan {
+        let compressor_config = self.codec.with_read_length_class(read_length_class);
+        let avg_length = crate::plan::avg_read_length(total_bases, total_reads as u64);
+        let worker_budget = crate::plan::worker_budget_bytes(self.memory_limit_mb);
+        plan_compression_layout(CompressionPlanInput {
+            requested_block_size: self.block_size,
+            avg_length,
+            max_block_bases: self.max_block_bases,
+            thread_limit: crate::plan::codec_thread_limit(self.num_threads, self.memory_limit_mb),
+            worker_budget_bytes: worker_budget,
+            total_reads: Some(total_reads as u64),
+            total_bases: Some(total_bases),
+            read_length_class,
+            codec_model_bytes: compressor_config.to_quality_config().estimated_model_bytes(),
+            auto_split_long_reads: true,
+        })
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.block_size > 0 && self.block_size < super::MIN_BLOCK_SIZE {
+        if self.enforce_min_block_size && self.block_size > 0 && self.block_size < crate::plan::MIN_BLOCK_SIZE {
             return Err(FqcError::InvalidArgument(format!(
                 "Block size {} is too small (min {})",
                 self.block_size,
-                super::MIN_BLOCK_SIZE
+                crate::plan::MIN_BLOCK_SIZE
             )));
         }
-        if self.block_size > super::MAX_BLOCK_SIZE {
+        if self.block_size > crate::plan::MAX_BLOCK_SIZE {
             return Err(FqcError::InvalidArgument(format!(
                 "Block size {} is too large (max {})",
                 self.block_size,
-                super::MAX_BLOCK_SIZE
+                crate::plan::MAX_BLOCK_SIZE
             )));
         }
         Ok(())
     }
-
-    fn block_compressor_config(&self) -> BlockCompressorConfig {
-        BlockCompressorConfig {
-            read_length_class: self.read_length_class,
-            quality_mode: self.quality_mode,
-            id_mode: self.id_mode,
-            zstd_level: BlockCompressorConfig::zstd_level_for_compression_level(self.compression_level),
-            ..Default::default()
-        }
-    }
-}
-
-fn num_cpus() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
 }
 
 // =============================================================================
@@ -132,13 +120,15 @@ fn fold_read_bytes(reads: &[ReadRecord]) -> (usize, u64) {
 }
 
 fn split_into_chunks(reads: Vec<ReadRecord>, block_size: usize) -> Vec<Vec<ReadRecord>> {
-    let mut reads = reads;
-    let mut chunks: Vec<Vec<ReadRecord>> = Vec::new();
-    while !reads.is_empty() {
-        let n = reads.len().min(block_size);
-        let rest = reads.split_off(n);
-        chunks.push(reads);
-        reads = rest;
+    let block_size = block_size.max(1);
+    let mut chunks = Vec::with_capacity(reads.len().div_ceil(block_size));
+    let mut reads = reads.into_iter();
+    loop {
+        let chunk: Vec<ReadRecord> = reads.by_ref().take(block_size).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        chunks.push(chunk);
     }
     chunks
 }
@@ -154,8 +144,13 @@ struct ReorderOutput {
 /// Single home of the reorder-map construction previously duplicated across
 /// run/run_paired/run_interleaved. When `enable` is false (or the analyzer
 /// skips reordering, e.g. long reads) reads pass through in input order.
-fn analyze_and_reorder(all_reads: Vec<ReadRecord>, reads_per_block: usize, enable: bool) -> Result<ReorderOutput> {
-    if !enable {
+fn analyze_and_reorder(
+    all_reads: Vec<ReadRecord>,
+    reads_per_block: usize,
+    reorder: ReorderMode,
+    read_length_class: ReadLengthClass,
+) -> Result<ReorderOutput> {
+    if !reorder.enabled() {
         return Ok(ReorderOutput {
             ordered_reads: all_reads,
             forward_map: None,
@@ -165,11 +160,12 @@ fn analyze_and_reorder(all_reads: Vec<ReadRecord>, reads_per_block: usize, enabl
     }
     let ga_config = GlobalAnalyzerConfig {
         reads_per_block,
+        reorder,
+        read_length_class: Some(read_length_class),
         ..Default::default()
     };
-    let sequences: Vec<String> = all_reads.iter().map(|r| r.sequence.clone()).collect();
     let analyzer = GlobalAnalyzer::new(ga_config);
-    let result = analyzer.analyze(&sequences)?;
+    let result = analyzer.analyze(&all_reads)?;
     let reordering_performed = result.reordering_performed;
     // reverse_map[archive_id] = original_id. When the analyzer skips
     // reordering (e.g. long reads) the maps are empty and all reads must
@@ -210,202 +206,248 @@ struct PreparedCompression {
     total_reads: usize,
     input_bytes: u64,
     total_bases: u64,
+    planned_workers: usize,
     parse_ms: u64,
     reorder_ms: u64,
     reorder_map: Option<(Vec<ReadId>, Vec<ReadId>)>,
-}
-
-// =============================================================================
-// Ordered compressed block for writer stage
-// =============================================================================
-
-struct OrderedBlock {
-    chunk_id: u32,
-    compressed: CompressedBlockData,
+    compressor_config: BlockCompressorConfig,
+    max_in_flight_blocks: usize,
 }
 
 // =============================================================================
 // CompressionPipeline
 // =============================================================================
 
+/// Full-ingest compressor used by both archive and pipeline modes.
+///
+/// The historical name is retained because the shared block pipeline lives in
+/// this module; `full_ingest_runner` is the engine-side entry point.
 pub struct CompressionPipeline {
     config: CompressionPipelineConfig,
-    control: PipelineControl,
-    stats: PipelineStats,
+    stats: OperationStats,
+    detected_read_length_class: Option<ReadLengthClass>,
 }
 
 impl CompressionPipeline {
     pub fn new(config: CompressionPipelineConfig) -> Self {
         Self {
             config,
-            control: PipelineControl::new(),
-            stats: PipelineStats::default(),
+            stats: OperationStats::default(),
+            detected_read_length_class: None,
         }
     }
 
-    pub fn stats(&self) -> &PipelineStats {
+    pub fn stats(&self) -> &OperationStats {
         &self.stats
     }
 
+    /// Class resolved from the last completed run; `None` before the first run.
+    pub fn detected_read_length_class(&self) -> Option<ReadLengthClass> {
+        self.detected_read_length_class
+    }
+
     /// Run compression on a single-end input file
-    pub fn run(&mut self, input_path: &str, output_path: impl AsRef<Path>, original_filename: &str) -> Result<()> {
+    pub fn run(
+        &mut self,
+        input_path: impl AsRef<Path>,
+        output_path: impl AsRef<Path>,
+        original_filename: &str,
+    ) -> Result<()> {
+        let input_path = input_path.as_ref();
         self.config.validate()?;
         let start = Instant::now();
-        let block_size = self.config.effective_block_size();
-
-        log::info!(
-            "Compression pipeline: {} threads, block_size={}",
-            self.config.effective_threads(),
-            block_size
-        );
 
         // ---- Phase 1: Read all records (needed for global analysis) ----
         let t_parse = Instant::now();
-        let all_reads = if input_path == "-" {
-            let mut parser = open_fastq_stdin();
-            parser.collect_all_within_archive_budget(self.config.memory_limit_mb)?
-        } else {
-            let mut parser = open_fastq(input_path)?;
-            parser.collect_all_within_archive_budget(self.config.memory_limit_mb)?
-        };
+        let all_reads = crate::fastq::ingest::read_all_records(input_path, self.config.memory_limit_mb)?;
 
         if all_reads.is_empty() {
-            return Err(FqcError::InvalidArgument("Input file is empty".to_string()));
+            return Err(FqcError::InvalidArgument(
+                "Input file contains no FASTQ records".to_string(),
+            ));
         }
         let parse_ms = t_parse.elapsed().as_millis() as u64;
-        let (input_bytes, total_bases) = fold_read_bytes(&all_reads);
-        let total_reads = all_reads.len();
-
-        log::info!("Read {} records ({} bytes)", all_reads.len(), input_bytes);
-
-        // ---- Phase 1b: Global analysis (reordering) ----
-        let t_reorder = Instant::now();
-        let reorder_gate = self.config.enable_reorder && !self.config.streaming_mode;
-        if reorder_gate {
-            log::info!("Running global analysis...");
-        }
-        let reorder = analyze_and_reorder(all_reads, block_size, reorder_gate)?;
-        let reorder_ms = t_reorder.elapsed().as_millis() as u64;
-
-        let ReorderOutput {
-            ordered_reads,
-            forward_map,
-            reverse_map,
-            reordering_performed,
-        } = reorder;
-        let reorder_map_written = reordering_performed && self.config.save_reorder_map;
-        let reorder_map = if reorder_map_written {
-            Some((
-                forward_map.ok_or_else(|| {
-                    FqcError::Compression("Reorder map metadata missing despite reorder_map_written=true".to_string())
-                })?,
-                reverse_map.ok_or_else(|| {
-                    FqcError::Compression("Reorder map metadata missing despite reorder_map_written=true".to_string())
-                })?,
-            ))
-        } else {
-            None
-        };
-
-        // ---- Phase 2+3: parallel compression and ordered write ----
-        let flags = build_flags(
-            false,
-            !reordering_performed,
-            self.config.quality_mode,
-            self.config.id_mode,
-            reorder_map_written,
-            self.config.pe_layout,
-            self.config.read_length_class,
-            self.config.streaming_mode,
-        );
-
-        let prepared = PreparedCompression {
-            chunks: split_into_chunks(ordered_reads, block_size),
-            flags,
-            total_reads,
-            input_bytes: input_bytes as u64,
+        let (parsed_bytes, total_bases) = fold_read_bytes(&all_reads);
+        let input_bytes = crate::stats::input_bytes_for_paths(&[input_path], parsed_bytes as u64);
+        self.finish_ingest(
+            all_reads,
             total_bases,
+            input_bytes,
             parse_ms,
-            reorder_ms,
-            reorder_map,
-        };
-        self.write_blocks_parallel(prepared, start, output_path, original_filename)
+            start,
+            output_path,
+            original_filename,
+            false,
+            PeLayout::Interleaved,
+        )
     }
 
     /// Run compression on paired-end input files
     pub fn run_paired(
         &mut self,
-        input1_path: &str,
-        input2_path: &str,
+        input1_path: impl AsRef<Path>,
+        input2_path: impl AsRef<Path>,
         output_path: impl AsRef<Path>,
         original_filename: &str,
         pe_layout: PeLayout,
     ) -> Result<()> {
+        let input1_path = input1_path.as_ref();
+        let input2_path = input2_path.as_ref();
         self.config.validate()?;
         let start = Instant::now();
 
-        log::info!("Reading paired-end files: {} + {}", input1_path, input2_path);
+        log::info!(
+            "Reading paired-end files: {} + {}",
+            input1_path.display(),
+            input2_path.display()
+        );
         let t_parse = Instant::now();
-        let mut pe_reader = open_fastq_paired(input1_path, input2_path)?;
-        let all_reads = pe_reader.collect_pairs_within_archive_budget(pe_layout, self.config.memory_limit_mb)?;
+        let all_reads = crate::fastq::ingest::read_all_paired_records(
+            input1_path,
+            input2_path,
+            pe_layout,
+            self.config.memory_limit_mb,
+        )?;
         if all_reads.is_empty() {
-            return Err(FqcError::InvalidArgument("Input files are empty".to_string()));
+            return Err(FqcError::InvalidArgument(
+                "Input file contains no FASTQ records".to_string(),
+            ));
         }
         let parse_ms = t_parse.elapsed().as_millis() as u64;
 
-        self.run_pair_based(all_reads, parse_ms, start, output_path, original_filename, pe_layout)
+        let (parsed_bytes, total_bases) = fold_read_bytes(&all_reads);
+        let input_bytes = crate::stats::input_bytes_for_paths(&[input1_path, input2_path], parsed_bytes as u64);
+        self.run_pair_based(
+            all_reads,
+            total_bases,
+            input_bytes,
+            parse_ms,
+            start,
+            output_path,
+            original_filename,
+            pe_layout,
+        )
     }
 
     /// Run compression on interleaved paired-end input in a single file.
     pub fn run_interleaved(
         &mut self,
-        input_path: &str,
+        input_path: impl AsRef<Path>,
         output_path: impl AsRef<Path>,
         original_filename: &str,
         pe_layout: PeLayout,
     ) -> Result<()> {
+        let input_path = input_path.as_ref();
         self.config.validate()?;
         let start = Instant::now();
 
-        log::info!("Reading interleaved paired-end file: {}", input_path);
+        log::info!("Reading interleaved paired-end file: {}", input_path.display());
         let t_parse = Instant::now();
-        let mut parser = if input_path == "-" {
-            crate::fastq::parser::InterleavedPeParser::new(open_fastq_stdin())
-        } else {
-            open_fastq_interleaved(input_path)?
-        };
-        let all_reads = parser.collect_pairs_within_archive_budget(pe_layout, self.config.memory_limit_mb)?;
+        let all_reads =
+            crate::fastq::ingest::read_all_interleaved_records(input_path, pe_layout, self.config.memory_limit_mb)?;
         if all_reads.is_empty() {
-            return Err(FqcError::InvalidArgument("Input file is empty".to_string()));
+            return Err(FqcError::InvalidArgument(
+                "Input file contains no FASTQ records".to_string(),
+            ));
         }
         let parse_ms = t_parse.elapsed().as_millis() as u64;
 
-        self.run_pair_based(all_reads, parse_ms, start, output_path, original_filename, pe_layout)
+        let (parsed_bytes, total_bases) = fold_read_bytes(&all_reads);
+        let input_bytes = crate::stats::input_bytes_for_paths(&[input_path], parsed_bytes as u64);
+        self.run_pair_based(
+            all_reads,
+            total_bases,
+            input_bytes,
+            parse_ms,
+            start,
+            output_path,
+            original_filename,
+            pe_layout,
+        )
     }
 
-    /// Shared tail of the paired topologies: global analysis, then the same
-    /// parallel compress-and-write core as single-end. Replaces the former
-    /// serial single-compressor loops (behavior: identical block content and
-    /// order; wall time now on par with the other topologies).
+    /// Shared tail of the paired topologies. Pairing is kept as one flat
+    /// stream, so reordering is disabled exactly like archive mode.
+    #[allow(clippy::too_many_arguments)]
     fn run_pair_based(
         &mut self,
         all_reads: Vec<ReadRecord>,
+        total_bases: u64,
+        input_bytes: u64,
         parse_ms: u64,
         start: Instant,
         output_path: impl AsRef<Path>,
         original_filename: &str,
         pe_layout: PeLayout,
     ) -> Result<()> {
-        let block_size = self.config.effective_block_size();
-        let (input_bytes, total_bases) = fold_read_bytes(&all_reads);
+        self.finish_ingest(
+            all_reads,
+            total_bases,
+            input_bytes,
+            parse_ms,
+            start,
+            output_path,
+            original_filename,
+            true,
+            pe_layout,
+        )
+    }
+
+    /// Classify once from the complete ingest, then plan, reorder and write.
+    ///
+    /// This is the single convergence point for all topologies. It replaces
+    /// the previous prefix pre-scan, which could classify a mixed-length input
+    /// differently from archive mode when long reads appeared past the sample.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_ingest(
+        &mut self,
+        all_reads: Vec<ReadRecord>,
+        total_bases: u64,
+        input_bytes: u64,
+        parse_ms: u64,
+        start: Instant,
+        output_path: impl AsRef<Path>,
+        original_filename: &str,
+        is_paired: bool,
+        pe_layout: PeLayout,
+    ) -> Result<()> {
         let total_reads = all_reads.len();
+        let length_stats = crate::plan::length_stats_from_records_sampled(&all_reads, self.config.scan_all_lengths);
+        let read_length_class =
+            crate::plan::effective_read_length_class(self.config.requested_read_length_class, &length_stats);
+        self.detected_read_length_class = Some(read_length_class);
+        let compressor_config = self.config.codec.with_read_length_class(read_length_class);
+
+        let plan = self.config.block_plan(total_reads, total_bases, read_length_class);
+        let block_size = plan.block_size;
+        let max_in_flight_blocks = crate::plan::effective_in_flight_blocks(
+            block_size,
+            &length_stats,
+            self.config.memory_limit_mb,
+            self.config.max_in_flight_blocks,
+        );
+
+        log::info!(
+            "Read {} records ({} bytes); class={}, block_size={}, workers={}, in_flight_blocks={}",
+            total_reads,
+            input_bytes,
+            read_length_class.as_str(),
+            block_size,
+            plan.workers,
+            max_in_flight_blocks
+        );
+
+        let reorder = if is_paired {
+            ReorderMode::Never
+        } else {
+            self.config.reorder
+        };
 
         let t_reorder = Instant::now();
-        let reorder = analyze_and_reorder(
-            all_reads,
-            block_size,
-            self.config.enable_reorder && !self.config.streaming_mode,
-        )?;
+        if reorder.enabled() {
+            log::info!("Running global analysis...");
+        }
+        let reorder = analyze_and_reorder(all_reads, block_size, reorder, read_length_class)?;
         let reorder_ms = t_reorder.elapsed().as_millis() as u64;
 
         let ReorderOutput {
@@ -429,31 +471,33 @@ impl CompressionPipeline {
         };
 
         let flags = build_flags(
-            true,
+            is_paired,
             !reordering_performed,
-            self.config.quality_mode,
-            self.config.id_mode,
+            compressor_config.quality_mode,
+            compressor_config.id_mode,
             reorder_map_written,
             pe_layout,
-            self.config.read_length_class,
-            self.config.streaming_mode,
+            read_length_class,
+            false,
         );
 
         let prepared = PreparedCompression {
             chunks: split_into_chunks(ordered_reads, block_size),
             flags,
             total_reads,
-            input_bytes: input_bytes as u64,
+            input_bytes,
             total_bases,
+            planned_workers: plan.workers,
             parse_ms,
             reorder_ms,
             reorder_map,
+            compressor_config,
+            max_in_flight_blocks,
         };
         self.write_blocks_parallel(prepared, start, output_path, original_filename)
     }
 
-    /// Threaded core shared by every pipeline topology: Reader → Compressor
-    /// (parallel) → Writer (ordered, transactional).
+    /// Shared tail: hand ordered chunks to the bounded block pipeline.
     fn write_blocks_parallel(
         &mut self,
         prepared: PreparedCompression,
@@ -461,179 +505,64 @@ impl CompressionPipeline {
         output_path: impl AsRef<Path>,
         original_filename: &str,
     ) -> Result<()> {
-        let num_chunks = prepared.chunks.len();
-        let max_inflight = self.config.max_in_flight_blocks;
-        let threads = self.config.effective_threads();
-        let compressor_config_arc = Arc::new(self.config.block_compressor_config());
-        let output_path_owned: PathBuf = output_path.as_ref().to_path_buf();
-        let original_filename_owned = original_filename.to_string();
-        let reorder_map_written = prepared.reorder_map.is_some();
+        let PreparedCompression {
+            chunks,
+            flags,
+            total_reads,
+            input_bytes,
+            total_bases,
+            planned_workers,
+            parse_ms,
+            reorder_ms,
+            reorder_map,
+            compressor_config,
+            max_in_flight_blocks,
+        } = prepared;
+        let reorder_map_written = reorder_map.is_some();
 
-        // Setup channels with bounded capacity for backpressure
-        let (chunk_tx, chunk_rx): (Sender<ReadChunk>, Receiver<ReadChunk>) = bounded(max_inflight);
-        let (block_tx, block_rx): (Sender<OrderedBlock>, Receiver<OrderedBlock>) = bounded(max_inflight);
-
-        let control = self.control.clone();
-
-        // ---- Reader thread: send chunks ----
-        let reader_control = control.clone();
-        let chunks = prepared.chunks;
-        let reader_handle = thread::spawn(move || -> Result<()> {
-            for (i, chunk_reads) in chunks.into_iter().enumerate() {
-                if reader_control.is_cancelled() {
-                    break;
-                }
-                let chunk = ReadChunk {
-                    reads: chunk_reads,
-                    chunk_id: i as u32,
-                };
-                chunk_tx
-                    .send(chunk)
-                    .map_err(|_| FqcError::Compression("Reader: channel closed".to_string()))?;
-            }
-            Ok(())
-        });
-
-        // ---- Compressor threads (parallel) ----
-        let num_compressor_threads = threads.max(1);
-        let mut compressor_handles = Vec::new();
-        let process_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-        for _ in 0..num_compressor_threads {
-            let rx = chunk_rx.clone();
-            let tx = block_tx.clone();
-            let cfg = compressor_config_arc.clone();
-            let ctrl = control.clone();
-            let process_ns = std::sync::Arc::clone(&process_ns);
-
-            let handle = thread::spawn(move || -> Result<()> {
-                let mut compressor = BlockCompressor::new((*cfg).clone());
-                for chunk in rx.iter() {
-                    if ctrl.is_cancelled() {
-                        break;
-                    }
-
-                    let t = Instant::now();
-                    let compressed = compressor.compress(&chunk.reads, chunk.chunk_id)?;
-                    process_ns.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-                    ctrl.add_reads(chunk.reads.len() as u64);
-
-                    tx.send(OrderedBlock {
-                        chunk_id: chunk.chunk_id,
-                        compressed,
-                    })
-                    .map_err(|_| FqcError::Compression("Compressor: channel closed".to_string()))?;
-                }
-                Ok(())
-            });
-            compressor_handles.push(handle);
-        }
-        // Drop extra sender so writer knows when all compressors are done
-        drop(chunk_rx);
-        drop(block_tx);
-
-        // ---- Writer thread: receive and write in order ----
-        let writer_control = control.clone();
-        let force_overwrite = self.config.force_overwrite;
-        let flags = prepared.flags;
-        let total_reads = prepared.total_reads;
-        let reorder_map = prepared.reorder_map;
-        let writer_handle = thread::spawn(move || -> Result<(u64, u64)> {
-            let t_write = Instant::now();
-            let (mut writer, output_tx) = begin_fqc_writer(&output_path_owned, force_overwrite)?;
-
-            let gh = GlobalHeader::new(
+        let expected_blocks =
+            u32::try_from(chunks.len()).map_err(|_| FqcError::Compression("block count exceeds u32".to_string()))?;
+        let mut chunks = chunks.into_iter();
+        let report = block_pipeline::run(
+            move || {
+                Ok(chunks
+                    .next()
+                    .map(|reads| block_pipeline::ReadBlock { reads, input_bytes: 0 }))
+            },
+            output_path,
+            BlockPipelineConfig {
+                num_workers: planned_workers,
+                max_in_flight_blocks,
+                force_overwrite: self.config.force_overwrite,
                 flags,
-                total_reads as u64,
-                &original_filename_owned,
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-            );
-            writer.write_global_header(&gh)?;
+                total_reads: Some(total_reads as u64),
+                expected_blocks: Some(expected_blocks),
+                original_filename: original_filename.to_string(),
+                reorder_map,
+                compressor_config,
+            },
+        )?;
 
-            // Collect blocks and write in order
-            let mut pending: std::collections::BTreeMap<u32, OrderedBlock> = std::collections::BTreeMap::new();
-            let mut next_expected: u32 = 0;
-            let mut total_output_bytes: u64 = 0;
-
-            for ordered_block in block_rx.iter() {
-                if writer_control.is_cancelled() {
-                    break;
-                }
-                pending.insert(ordered_block.chunk_id, ordered_block);
-
-                // Write all consecutive blocks starting from next_expected
-                while let Some(block) = pending.remove(&next_expected) {
-                    writer.write_block(&block.compressed)?;
-                    total_output_bytes += block.compressed.total_compressed_size() as u64;
-                    next_expected += 1;
-                }
-            }
-
-            // A worker error or cancellation closes the channel early. Never
-            // commit a partial archive: the transaction drops the temp file.
-            if next_expected < num_chunks as u32 || !pending.is_empty() {
-                return Err(FqcError::Compression(format!(
-                    "Compression incomplete: wrote {}/{} blocks; output aborted",
-                    next_expected + pending.len() as u32,
-                    num_chunks
-                )));
-            }
-
-            // Write reorder map if present
-            if reorder_map_written {
-                let (fwd, rev) = reorder_map.as_ref().ok_or_else(|| {
-                    FqcError::Compression("Reorder map metadata missing despite reorder_map_written=true".to_string())
-                })?;
-                writer.write_reorder_map(fwd, rev)?;
-            }
-
-            writer.finalize()?;
-            output_tx.commit()?;
-            Ok((total_output_bytes, t_write.elapsed().as_millis() as u64))
-        });
-
-        // ---- Wait for all stages ----
-        reader_handle
-            .join()
-            .map_err(|_| FqcError::Compression("Reader thread panicked".to_string()))??;
-        for h in compressor_handles {
-            h.join()
-                .map_err(|_| FqcError::Compression("Compressor thread panicked".to_string()))??;
-        }
-        let process_ms = process_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000;
-        let (output_bytes, write_ms) = writer_handle
-            .join()
-            .map_err(|_| FqcError::Compression("Writer thread panicked".to_string()))??;
-
-        // ---- Collect stats ----
-        let elapsed = start.elapsed();
-        self.stats = PipelineStats {
-            total_reads: prepared.total_reads as u64,
-            total_bases: prepared.total_bases,
-            total_blocks: num_chunks as u32,
-            input_bytes: prepared.input_bytes,
-            output_bytes,
-            processing_time_ms: elapsed.as_millis() as u64,
+        self.stats = OperationStats {
+            total_reads: total_reads as u64,
+            total_bases,
+            blocks: report.blocks_written,
+            input_bytes,
+            output_bytes: report.output_bytes,
+            elapsed_seconds: start.elapsed().as_secs_f64(),
             reorder_map_written,
             corrupted_blocks: 0,
-            parse_ms: prepared.parse_ms,
-            reorder_ms: prepared.reorder_ms,
-            process_ms,
-            write_ms,
+            parse_ms,
+            reorder_ms,
+            process_ms: report.process_ms,
+            write_ms: report.write_ms,
         };
 
         log::info!(
             "Compression complete: {} reads, {} blocks, {:.2}x ratio, {:.1} MB/s",
             self.stats.total_reads,
-            self.stats.total_blocks,
-            if self.stats.compression_ratio() > 0.0 {
-                1.0 / self.stats.compression_ratio()
-            } else {
-                0.0
-            },
+            self.stats.blocks,
+            self.stats.compression_ratio(),
             self.stats.throughput_mbps(),
         );
 

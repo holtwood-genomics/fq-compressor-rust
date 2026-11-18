@@ -6,6 +6,8 @@ use fqc::algo::block_compressor::*;
 use fqc::archive::format::*;
 use fqc::archive::reader::FqcReader;
 use fqc::archive::writer::FqcWriter;
+use fqc::block::id_codec::{delta_decode_ids, delta_encode_ids};
+use fqc::block::{DecodedBlock, EncodedBlock};
 use fqc::types::*;
 
 fn make_reads(n: usize, length: usize) -> Vec<ReadRecord> {
@@ -19,7 +21,7 @@ fn make_reads(n: usize, length: usize) -> Vec<ReadRecord> {
         .collect()
 }
 
-fn decompress_block(compressor: &mut BlockCompressor, compressed: &CompressedBlockData) -> DecompressedBlockData {
+fn decompress_block(compressor: &mut BlockCompressor, compressed: &EncodedBlock) -> DecodedBlock {
     compressor
         .decompress_raw(
             0,
@@ -141,7 +143,7 @@ fn test_block_compress_decompress_variable_length() {
     let compressed = compressor.compress(&reads, 2).unwrap();
     assert_eq!(compressed.read_count, 15);
     assert_eq!(compressed.uniform_read_length, 0); // variable
-    assert!(!compressed.aux_stream.is_empty()); // aux needed for lengths
+    assert_ne!(compressed.aux_stream, Vec::<u8>::new()); // aux needed for lengths
 
     let decompressed = decompress_block(&mut compressor, &compressed);
     for (orig, dec) in reads.iter().zip(decompressed.reads.iter()) {
@@ -167,7 +169,7 @@ fn test_block_compress_quality_discard() {
     let mut compressor = BlockCompressor::new(config);
 
     let compressed = compressor.compress(&reads, 0).unwrap();
-    assert!(compressed.qual_stream.is_empty());
+    assert_eq!(compressed.qual_stream, Vec::<u8>::new());
 
     let decompressed = decompress_block(&mut compressor, &compressed);
     for (orig, dec) in reads.iter().zip(decompressed.reads.iter()) {
@@ -289,7 +291,7 @@ fn test_block_compress_decompress_empty() {
             &compressed.aux_stream,
         )
         .unwrap();
-    assert!(decompressed.reads.is_empty());
+    assert_eq!(decompressed.reads, [] as [ReadRecord; 0]);
 }
 
 #[test]
@@ -370,21 +372,21 @@ fn test_full_archive_roundtrip() {
         assert_eq!(reader.block_count(), 1);
 
         let block_data = reader.read_block(0).unwrap();
-        let bh = &block_data.header;
+        let bh = &block_data.meta;
 
         let decompressed = compressor
             .decompress_raw(
                 bh.block_id,
-                bh.uncompressed_count,
+                bh.read_count,
                 bh.uniform_read_length,
                 bh.codec_ids,
                 bh.codec_seq,
                 bh.codec_qual,
                 bh.codec_aux,
-                &block_data.ids_data,
-                &block_data.seq_data,
-                &block_data.qual_data,
-                &block_data.aux_data,
+                &block_data.id_stream,
+                &block_data.seq_stream,
+                &block_data.qual_stream,
+                &block_data.aux_stream,
             )
             .unwrap();
 
@@ -460,7 +462,7 @@ fn test_archive_with_reorder_map() {
 fn test_writer_rejects_invalid_reorder_map() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("invalid-map.fqc");
-    let mut writer = FqcWriter::create(&path).unwrap();
+    let mut writer = FqcWriter::create(path).unwrap();
 
     let err = writer.write_reorder_map(&[0, 0], &[0, 1]).unwrap_err();
     assert!(matches!(err, fqc::error::FqcError::InvalidArgument(_)));
