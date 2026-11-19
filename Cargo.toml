@@ -21,7 +21,7 @@ name = "fqc"
 path = "src/lib.rs"
 
 [dependencies]
-clap = { version = "=4.5.60", features = ["derive"] }
+clap = { version = "=4.6.1", features = ["derive"] }
 zstd = "=0.14.3"
 xxhash-rust = { version = "=0.8.19", features = ["xxh64"] }
 # rayon 1.11+ 要求 Rust 1.80；MSRV 1.75 期间固定在 1.10。
