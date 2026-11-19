@@ -11,6 +11,12 @@ updates:
       # bzip2 0.6+ 要求 Rust 1.82；0.5.x 是当前 MSRV 上限。
       - dependency-name: "bzip2"
         versions: [">=0.6.0"]
+      # clap 4.6+ 的 clap_derive 使用 edition 2024；MSRV 1.75 无法编译。
+      - dependency-name: "clap"
+        versions: [">=4.6.0"]
+      # zstd 0.14.4 的 zstd-sys 2.1.3 引入 BSD-2-Clause；当前许可证白名单未允许。
+      - dependency-name: "zstd"
+        versions: [">=0.14.4"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
