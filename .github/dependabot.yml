@@ -4,6 +4,13 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # MSRV 1.75：rayon 1.11+ 要求 Rust 1.80。提升 MSRV 后移除。
+      - dependency-name: "rayon"
+        versions: [">=1.11.0"]
+      # bzip2 0.6+ 要求 Rust 1.82；0.5.x 是当前 MSRV 上限。
+      - dependency-name: "bzip2"
+        versions: [">=0.6.0"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
