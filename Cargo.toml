@@ -24,12 +24,14 @@ path = "src/lib.rs"
 clap = { version = "=4.5.60", features = ["derive"] }
 zstd = "=0.14.3"
 xxhash-rust = { version = "=0.8.19", features = ["xxh64"] }
+# rayon 1.11+ 要求 Rust 1.80；MSRV 1.75 期间固定在 1.10。
 rayon = "=1.10.0"
 thiserror = "=1.0.69"
 byteorder = "=1.5.0"
 log = "=0.4.35"
 env_logger = "=0.11.11"
 flate2 = { version = "=1.1.11", optional = true }
+# bzip2 0.6+ 要求 Rust 1.82；0.5.2 是当前 MSRV 可用的最新版本。
 bzip2 = { version = "=0.5.2", optional = true }
 xz2 = { version = "=0.1.7", optional = true }
 crossbeam-channel = "=0.5.15"
