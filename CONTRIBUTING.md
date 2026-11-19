@@ -10,7 +10,7 @@
 
 ## 提交 issue
 
-用 [issue 模板](https://github.com/open-genomics/fq-compressor-rust/issues/new/choose)：
+用 [issue 模板](https://github.com/holtwood-genomics/fq-compressor-rust/issues/new/choose)：
 bug 报告请附上复现命令、输入数据（或最小切片）与期望行为。
 
 ## 提 PR

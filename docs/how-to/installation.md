@@ -8,7 +8,7 @@
 - Git
 
 ```bash
-git clone https://github.com/open-genomics/fq-compressor-rust.git
+git clone https://github.com/holtwood-genomics/fq-compressor-rust.git
 cd fq-compressor-rust
 cargo build --release
 ./target/release/fqc --help

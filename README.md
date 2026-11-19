@@ -1,7 +1,7 @@
 # fq-compressor-rust
 
 [![License](https://img.shields.io/badge/license-GPL--3.0-green)](https://www.gnu.org/licenses/gpl-3.0.en.html)
-[![CI](https://github.com/open-genomics/fq-compressor-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/open-genomics/fq-compressor-rust/actions/workflows/ci.yml)
+[![CI](https://github.com/holtwood-genomics/fq-compressor-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/holtwood-genomics/fq-compressor-rust/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange)](Cargo.toml)
 
 `fqc` 是一个用 Rust 编写的 FASTQ 压缩工具，围绕块索引的 `.fqc` 归档格式构建。
@@ -10,13 +10,13 @@
 *A block-indexed FASTQ archive format and CLI in Rust — compress, inspect, verify, partially stream.*
 
 > **格式族：`fqc-indexed/v2`**。`fqc` 与 `.fqc` 是两个**同名、不同格式族**的产品：
-> 本仓库（Rust）与 [`fq-compressor`](https://github.com/open-genomics/fq-compressor)（C++）
+> 本仓库（Rust）与 [`fq-compressor`](https://github.com/holtwood-genomics/fq-compressor)（C++）
 > 各自实现自己的 `fqc` 二进制与 `.fqc` 归档，magic 不同、互不兼容、不能互相解码。
 
 | 仓库 | 实现语言 | 格式族 ID | 完整 magic | 访问模型 |
 |---|---|---|---|---|
-| [open-genomics/fq-compressor-rust](https://github.com/open-genomics/fq-compressor-rust)（本仓库） | Rust | `fqc-indexed/v2` | `89 46 51 43 0D 0A 1A 0A` | 块索引归档；支持检视/校验/部分流式 |
-| [open-genomics/fq-compressor](https://github.com/open-genomics/fq-compressor) | C++23 | `fqc-sequential/v2` | `46 51 43 56 32 0D 0A 1A`（`FQCV2\r\n\x1A`） | 顺序流式归档；不支持随机访问/按区间提取 |
+| [holtwood-genomics/fq-compressor-rust](https://github.com/holtwood-genomics/fq-compressor-rust)（本仓库） | Rust | `fqc-indexed/v2` | `89 46 51 43 0D 0A 1A 0A` | 块索引归档；支持检视/校验/部分流式 |
+| [holtwood-genomics/fq-compressor](https://github.com/holtwood-genomics/fq-compressor) | C++23 | `fqc-sequential/v2` | `46 51 43 56 32 0D 0A 1A`（`FQCV2\r\n\x1A`） | 顺序流式归档；不支持随机访问/按区间提取 |
 
 扩展名 `.fqc` 不能判定格式：reader 必须检查 archive magic，两个实现以显式的
 unsupported-format-family 错误拒绝对方的 magic，不能互相解码。
@@ -76,11 +76,11 @@ GPL-3.0-or-later，见 [LICENSE](LICENSE)。
 
 ## 相关项目
 
-- [fq-compressor](https://github.com/open-genomics/fq-compressor) — 同题 C++23 实现（顺序流式 `.fqc`，同名不同格式族、互不兼容）
-- [minibwa-rust](https://github.com/open-genomics/minibwa-rust) — 短读比对器（同属组织 Rust 线）
+- [fq-compressor](https://github.com/holtwood-genomics/fq-compressor) — 同题 C++23 实现（顺序流式 `.fqc`，同名不同格式族、互不兼容）
+- [minibwa-rust](https://github.com/holtwood-genomics/minibwa-rust) — 短读比对器（同属组织 Rust 线）
 
 <div align="center">
 
-本仓库属于 [**Open Genomics**](https://github.com/open-genomics) · 高性能生物信息学系统软件与中文知识库
+本仓库属于 [**Holtwood Genomics**](https://github.com/holtwood-genomics) · 高性能生物信息学系统软件与中文知识库
 
 </div>

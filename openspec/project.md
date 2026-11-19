@@ -8,7 +8,7 @@
 
 ## Identity
 
-- **Canonical repository**: `open-genomics/fq-compressor-rust`
+- **Canonical repository**: `holtwood-genomics/fq-compressor-rust`
 - **Product name**: `fqc`
 - **Archive extension**: `.fqc`
 - **Format family**: `fqc-indexed/v2`

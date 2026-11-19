@@ -3,7 +3,7 @@
 ## Metadata
 
 - Status: `Archived`
-- Repository: `open-genomics/fq-compressor-rust`
+- Repository: `holtwood-genomics/fq-compressor-rust`
 - Base commit: `2c5290186f4e2be5498e681e771376674f0c168f`
 - Capability: `format-governance`
 - Task IDs: `FQC-DOC-001`

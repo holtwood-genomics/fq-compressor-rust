@@ -3,7 +3,7 @@
 ## Metadata
 
 - Status: `Archived`
-- Repository: `open-genomics/fq-compressor-rust`
+- Repository: `holtwood-genomics/fq-compressor-rust`
 - Capability: `archive-format`
 - Task IDs: `FQCR-CODEC-001`
 - Prerequisites: `correct-indexed-v2-spec` (FQCR-SPEC-001)

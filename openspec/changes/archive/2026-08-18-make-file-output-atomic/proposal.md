@@ -3,7 +3,7 @@
 ## Metadata
 
 - Status: `Archived`
-- Repository: `open-genomics/fq-compressor-rust`
+- Repository: `holtwood-genomics/fq-compressor-rust`
 - Capability: `file-output`
 - Task IDs: `FQCR-IO-001`
 - Decision IDs: (none; follows maintenance-design/02 §5)

@@ -10,7 +10,7 @@
 
 Rust reader treated the C++ sequential magic as a generic bad magic. Users with
 the wrong `fqc` on `PATH` need a clear “other known family” error pointing at
-`open-genomics/fq-compressor`.
+`holtwood-genomics/fq-compressor`.
 
 ## Changes
 

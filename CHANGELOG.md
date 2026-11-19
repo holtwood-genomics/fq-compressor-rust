@@ -147,7 +147,7 @@
   ingest check (it is still not a bounded-memory streaming path).
 - Cross-family magic dispatch: reject C++ `fqc-sequential/v2` archives with an
   explicit unsupported-format-family error pointing at
-  `open-genomics/fq-compressor` (unknown/truncated magics stay distinct).
+  `holtwood-genomics/fq-compressor` (unknown/truncated magics stay distinct).
 - Operation-scoped decode/verify memory budget (`DecodeBudget`): `--memory-limit`
   applies to decompress and full verify; archive-declared sizes and zstd output
   are capped before allocation; automatic (`0`) remains finite with hard
@@ -204,7 +204,7 @@
   ingest check (it is still not a bounded-memory streaming path).
 - Cross-family magic dispatch: reject C++ `fqc-sequential/v2` archives with an
   explicit unsupported-format-family error pointing at
-  `open-genomics/fq-compressor` (unknown/truncated magics stay distinct).
+  `holtwood-genomics/fq-compressor` (unknown/truncated magics stay distinct).
 - Operation-scoped decode/verify memory budget (`DecodeBudget`): `--memory-limit`
   applies to decompress and full verify; archive-declared sizes and zstd output
   are capped before allocation; automatic (`0`) remains finite with hard
@@ -296,7 +296,7 @@
   `src/engine/`, `common/memory_budget` flattened to the top level.
 - Docs converted to plain Markdown with a `docs/README.md` index.
 - Consolidated all development branches into master; repository moved to the
-  open-genomics organization.
+  holtwood-genomics organization.
 - 内部重构（行为不变，T4 架构收敛）：解压编排下沉至
   `pipeline/decompression_classic.rs`（`commands/decompress.rs` 退化为薄 CLI
   层）；压缩 7 条执行路径收敛为"骨架 + 拓扑参数"（`pipeline/compression.rs`
@@ -350,7 +350,7 @@
   fictional v1 fallback (reader accepts only major == 2); removed nonexistent
   `LEGACY_LONG_READ_MODE` at bit 2; replaced nonexistent QVZ stream type with
   actual codec families.
-- All stale org links (LessUp -> open-genomics).
+- All stale org links (LessUp -> holtwood-genomics).
 - README CLI example: `--memory-limit` is a global flag and must precede the subcommand.
 - `test_pipeline_concurrency` 移除"秒级时间戳必须变化"的偶发假红断言（三次快速
   压缩同秒完成属正常行为；测试本意是内容稳定性，予以保留）。
@@ -392,6 +392,6 @@
 - Core `compress`, `decompress`, `info`, and `verify` commands shipped.
 - `.fqc` block-indexed archive format released with paired-end support.
 
-[Unreleased]: https://github.com/open-genomics/fq-compressor-rust/compare/v0.1.1...HEAD
-[0.1.1]: https://github.com/open-genomics/fq-compressor-rust/releases/tag/v0.1.1
-[0.1.0]: https://github.com/open-genomics/fq-compressor-rust/releases/tag/v0.1.0
+[Unreleased]: https://github.com/holtwood-genomics/fq-compressor-rust/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/holtwood-genomics/fq-compressor-rust/releases/tag/v0.1.1
+[0.1.0]: https://github.com/holtwood-genomics/fq-compressor-rust/releases/tag/v0.1.0

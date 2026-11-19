@@ -4,7 +4,7 @@
 
 请通过 GitHub 的**私有漏洞上报**功能报告安全问题，不要公开披露未修复的漏洞：
 
-<https://github.com/open-genomics/fq-compressor-rust/security/advisories>
+<https://github.com/holtwood-genomics/fq-compressor-rust/security/advisories>
 
 ## 处理承诺
 
