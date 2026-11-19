@@ -22,7 +22,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # clap 4.6+ 的 clap_derive 使用 edition 2024；MSRV 1.75 无法编译。
-clap = { version = "=4.5.60", features = ["derive"] }
+clap = { version = "=4.5.61", features = ["derive"] }
 # zstd 0.14.4 的 zstd-sys 2.1.3 引入 BSD-2-Clause；当前许可证白名单未允许。
 zstd = "=0.14.3"
 xxhash-rust = { version = "=0.8.21", features = ["xxh64"] }
