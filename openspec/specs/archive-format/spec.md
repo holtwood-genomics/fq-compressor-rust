@@ -105,5 +105,5 @@ format errors. Sequential archives SHALL NOT be decoded.
 - **GIVEN** an archive beginning with `46 51 43 56 32 0D 0A 1A`
 - **WHEN** info, verify, or decompress opens it
 - **THEN** the command SHALL fail with an unsupported-format-family error
-  naming `fqc-sequential/v2` and `open-genomics/fq-compressor`
+  naming `fqc-sequential/v2` and `holtwood-genomics/fq-compressor`
 - **AND** decompress SHALL NOT create the output path

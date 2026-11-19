@@ -34,7 +34,7 @@ use std::io::{Read, Write};
 
 /// Indexed family magic (`fqc-indexed/v2`) — this implementation.
 pub const MAGIC_BYTES: [u8; 8] = [0x89, b'F', b'Q', b'C', 0x0D, 0x0A, 0x1A, 0x0A];
-/// Sequential family magic (`fqc-sequential/v2`) — C++ `open-genomics/fq-compressor`.
+/// Sequential family magic (`fqc-sequential/v2`) — C++ `holtwood-genomics/fq-compressor`.
 pub const SEQUENTIAL_MAGIC_BYTES: [u8; 8] = [0x46, 0x51, 0x43, 0x56, 0x32, 0x0D, 0x0A, 0x1A];
 pub const MAGIC_END: [u8; 8] = [b'F', b'Q', b'C', b'_', b'E', b'O', b'F', 0x00];
 
@@ -700,7 +700,7 @@ pub fn magic_dispatch_error(magic: [u8; 8]) -> Result<()> {
         MagicFamily::Indexed => Ok(()),
         MagicFamily::Sequential => Err(FqcError::UnsupportedFormat(
             "unsupported FQC format family: fqc-sequential/v2 \
-             (magic 46 51 43 56 32 0D 0A 1A); use open-genomics/fq-compressor"
+             (magic 46 51 43 56 32 0D 0A 1A); use holtwood-genomics/fq-compressor"
                 .to_string(),
         )),
         MagicFamily::Unknown => Err(FqcError::Format(

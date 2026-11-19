@@ -26,7 +26,7 @@ fn assert_sequential_family_reject(err: FqcError) {
             assert!(
                 msg.contains("unsupported FQC format family")
                     && msg.contains("fqc-sequential/v2")
-                    && msg.contains("open-genomics/fq-compressor"),
+                    && msg.contains("holtwood-genomics/fq-compressor"),
                 "unexpected message: {msg}"
             );
         }

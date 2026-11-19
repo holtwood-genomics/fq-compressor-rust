@@ -1,6 +1,6 @@
 # Foreign sequential fixture (for family rejection)
 
-Copied from `open-genomics/fq-compressor` `tests/fixtures/sequential-v2/frozen_se.fqc`
+Copied from `holtwood-genomics/fq-compressor` `tests/fixtures/sequential-v2/frozen_se.fqc`
 for `FQC-FAMILY-001` / `recognize-sequential-fqc-family`.
 
 | Field | Value |

@@ -8,7 +8,7 @@ Status: implemented
 
 ## 决定
 
-两个实现都保留 `fqc` / `.fqc`，不引入区分后缀或改名（openspec `project.md` 记录的决策 `FQC-DEC-001`）；格式家族由归档头 8 字节 magic 区分。reader 在读取版本字节之前先用 `classify_magic` / `magic_dispatch_error` 分类：sequential magic 映射为 `UnsupportedFormat`，报错文案锁定点名 `fqc-sequential/v2` 与 `open-genomics/fq-compressor`；未知或截断 magic 仍报 `Format`。本实现不解码 sequential 归档，只承诺识别并指路。`info`/`verify`/`decompress` 三个入口行为一致；C++ 的 `frozen_se.fqc` 拷贝为 fixture 锁定该行为（`tests/fixtures/foreign-sequential-v2/`）。
+两个实现都保留 `fqc` / `.fqc`，不引入区分后缀或改名（openspec `project.md` 记录的决策 `FQC-DEC-001`）；格式家族由归档头 8 字节 magic 区分。reader 在读取版本字节之前先用 `classify_magic` / `magic_dispatch_error` 分类：sequential magic 映射为 `UnsupportedFormat`，报错文案锁定点名 `fqc-sequential/v2` 与 `holtwood-genomics/fq-compressor`；未知或截断 magic 仍报 `Format`。本实现不解码 sequential 归档，只承诺识别并指路。`info`/`verify`/`decompress` 三个入口行为一致；C++ 的 `frozen_se.fqc` 拷贝为 fixture 锁定该行为（`tests/fixtures/foreign-sequential-v2/`）。
 
 出处：openspec 归档变更 `recognize-sequential-fqc-family`（`FQC-FAMILY-001`，2026-08-18 归档）。
 
@@ -20,7 +20,7 @@ Status: implemented
 
 ## 后果
 
-- **收益**：拿错工具的用户得到指向 `open-genomics/fq-compressor` 的明确错误；magic 分类先于版本/头解析，坏输入的面最小。
+- **收益**：拿错工具的用户得到指向 `holtwood-genomics/fq-compressor` 的明确错误；magic 分类先于版本/头解析，坏输入的面最小。
 - **代价与已知上限**：识别不等于兼容，两家族永久互拒——若未来要互通须另立新决定而非放宽此检查；magic 前 8 字节成为跨仓库的稳定契约，任何改 magic 的格式演进必须同时更新两侧分类逻辑。
 
 ## 验证
